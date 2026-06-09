@@ -155,6 +155,11 @@ compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT ra
 compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT raytracing/Shade.spv ENTRY Shade
     EXTRA_DEPENDS ${RT_SHADER_DEPS})
 
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchHW.spv ENTRY benchHardware
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchSW.spv ENTRY benchSoftware
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+
 add_custom_target(shaders ALL DEPENDS ${NGAPI_SHADER_OUTPUTS})
 
 # The library's internal PatchDescriptors shader is embedded as a checked-in
@@ -190,6 +195,11 @@ add_windowed_sample(raytracing samples/raytracing/Raytracing.cpp)
 # Headless sample: no window, no shaders/assets.
 add_executable(multiplegpus samples/multiplegpus/MultipleGPUs.cpp)
 target_link_libraries(multiplegpus PRIVATE ngapi::ngapi)
+
+# Headless hardware-vs-software sampler benchmark (run from build/bin).
+add_executable(samplerbench samples/samplerbench/SamplerBench.cpp)
+target_link_libraries(samplerbench PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(samplerbench shaders)
 endif() # NGAPI_BUILD_SAMPLES
 
 # ---------------------------------------------------------------------------
