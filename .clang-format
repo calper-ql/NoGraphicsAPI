@@ -1,0 +1,21 @@
+# Default style for this project's own C++ and Slang sources.
+# Applied via ./format.sh (which scopes to src/ platform/ samples/ shaders/ only).
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 0
+BreakBeforeBraces: Allman
+PointerAlignment: Left
+NamespaceIndentation: All
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: None
+AllowShortBlocksOnASingleLine: Never
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+Cpp11BracedListStyle: false
+SortIncludes: false
+ReflowComments: false
+...
