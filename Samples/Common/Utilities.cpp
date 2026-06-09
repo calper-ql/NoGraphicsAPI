@@ -2,14 +2,24 @@
 
 #include "../../External/stb_image.h"
 
+#include <cstring>
+#include <iostream>
+
 std::vector<uint8_t> loadIR(const std::filesystem::path &path)
 {
     std::ifstream file { path, std::ios::binary | std::ios::ate };
     if (!file.is_open())
     {
+        std::cerr << "loadIR: failed to open shader IR '" << path.string()
+                  << "' (cwd: " << std::filesystem::current_path().string() << ")\n";
         return {};
     }
     auto size = file.tellg();
+    if (size <= 0)
+    {
+        std::cerr << "loadIR: shader IR '" << path.string() << "' is empty\n";
+        return {};
+    }
     std::vector<uint8_t> buffer(size);
     file.seekg(0);
     file.read(reinterpret_cast<char*>(buffer.data()), size);
@@ -146,8 +156,8 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
 {
     allocator = new LinearAllocator(device);
 
-    auto textIRVertex = loadIR("../Shaders/Common/TextVertex.spv");
-    auto textIRPixel = loadIR("../Shaders/Common/TextPixel.spv");
+    auto textIRVertex = loadIR("Shaders/Common/TextVertex.spv");
+    auto textIRPixel = loadIR("Shaders/Common/TextPixel.spv");
 
     ColorTarget colorTarget = {};
     colorTarget.format = textureDesc.format;
@@ -158,6 +168,11 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
     };
 
     pipeline = gpuCreateGraphicsPipeline(device, ByteSpan(textIRVertex), ByteSpan(textIRPixel), rasterDesc);
+
+    // The text pass has no depth/stencil buffer. The graphics pipeline declares
+    // depth/stencil/depth-bias enable as dynamic state, so a (disabled) state
+    // must be set before drawing; a default-constructed desc disables them all.
+    depthStencilState = gpuCreateDepthStencilState(GpuDepthStencilDesc{});
 
     std::vector<uint32_t> indices = { 0, 1, 2, 2, 3, 0 };
     
@@ -205,6 +220,7 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
 TextRenderer::~TextRenderer()
 {
     gpuFreePipeline(pipeline);
+    gpuFreeDepthStencilState(depthStencilState);
     gpuDestroyTexture(atlas);
     gpuFree(device, atlasPtr);
     allocator->free();
@@ -239,6 +255,7 @@ void TextRenderer::renderText(GpuCommandBuffer cmd, GpuTexture target, const std
     };
 
     gpuSetPipeline(cmd, pipeline);
+    gpuSetDepthStencilState(cmd, depthStencilState);
     gpuSetActiveTextureHeapPtr(cmd, textureHeap.gpu);
     gpuBeginRenderPass(cmd, renderPassDesc);
     gpuDrawIndexedInstanced(cmd, vertexData.gpu, pixelData.gpu, indexData.gpu, 6, static_cast<uint32_t>(text.size()));

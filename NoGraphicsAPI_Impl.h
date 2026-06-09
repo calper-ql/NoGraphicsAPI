@@ -13,18 +13,24 @@
     using object = object##_T*;
 
 // Vector types
-using int2 = struct { int x, y; };
-using int3 = struct { int x, y, z; };
-using int4 = struct { int x, y, z, w; };
+// NOTE: these are named structs rather than aliases of anonymous structs
+// (e.g. `using uint3 = struct { ... };`). GCC does not extend the
+// "typedef name for linkage purposes" rule ([dcl.typedef]/9) to alias
+// declarations, so anonymous structs named only via `using` have no linkage
+// there, which makes API functions taking them by value fail to link. Named
+// structs have linkage on every compiler while preserving the same layout.
+struct int2 { int x, y; };
+struct int3 { int x, y, z; };
+struct int4 { int x, y, z, w; };
 using uint = uint32_t;
-using uint2 = struct { uint x, y; };
-using uint3 = struct { uint x, y, z; };
-using uint4 = struct { uint x, y, z, w; };
-using float2 = struct { float x, y; };
-using float3 = struct { float x, y, z; };
-using float4 = struct { float x, y, z, w; };
-using float3x4 = struct { float4 row0, row1, row2; };
-using float4x4 = struct { float4 row0, row1, row2, row3; };
+struct uint2 { uint x, y; };
+struct uint3 { uint x, y, z; };
+struct uint4 { uint x, y, z, w; };
+struct float2 { float x, y; };
+struct float3 { float x, y, z; };
+struct float4 { float x, y, z, w; };
+struct float3x4 { float4 row0, row1, row2; };
+struct float4x4 { float4 row0, row1, row2, row3; };
 
 // Use standard library span
 template<typename T>

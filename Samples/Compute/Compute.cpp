@@ -26,7 +26,7 @@ void computeSample()
     auto queue = gpuCreateQueue(device);
     auto semaphore = gpuCreateSemaphore(device, 0);
 
-    auto computeIR = loadIR("../Shaders/Compute/Compute.spv");
+    auto computeIR = loadIR("Shaders/Compute/Compute.spv");
     auto pipeline = gpuCreateComputePipeline(device, ByteSpan(computeIR.data(), computeIR.size()));
 
     auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);
@@ -116,6 +116,14 @@ void computeSample()
     }
 
     gpuWaitSemaphore(semaphore, nextFrame - 1);
+
+    // Destroy the swapchain first: it drains all queues (including the present
+    // queue) and releases the swapchain images, present semaphores and surface
+    // before the device/instance are torn down. Destroying the device while
+    // these children are still alive hangs drivers that honour object lifetimes.
+    gpuDestroySwapchain(swapchain);
+    SDL_Gpu_DestroySurface(surface);
+    SDL_DestroyWindow(window);
 
     stbi_image_free(inputImage);
 

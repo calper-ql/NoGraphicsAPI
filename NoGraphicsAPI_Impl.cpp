@@ -9,6 +9,7 @@
 #include <vector>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
 #include "NoGraphicsAPI_Impl.h"
 
 std::vector<uint8_t> gpuHiddenLoadIR(const std::filesystem::path &path)
@@ -31,12 +32,16 @@ struct GpuPipeline_T
     VkPipelineBindPoint bindPoint;
     GpuDevice device;
 };
-struct GpuTexture_T 
-{ 
-    GpuTextureDesc desc = {}; 
-    VkImage image = VK_NULL_HANDLE; 
+struct GpuTexture_T
+{
+    GpuTextureDesc desc = {};
+    VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     GpuDevice device;
+    // Tracks the image's current Vulkan layout so transitions can be issued
+    // automatically. Images rest in VK_IMAGE_LAYOUT_GENERAL; only swapchain
+    // images move to PRESENT_SRC for presentation.
+    VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
 struct VulkanDevice;
 struct GpuDevice_T { VulkanDevice* vulkanDevice = nullptr; };
@@ -55,6 +60,7 @@ struct GpuSwapchain_T
     GpuTextureDesc desc = {};
     std::vector<GpuTexture> images;
     std::vector<VkSemaphore> presentSemaphores;
+    std::vector<VkCommandBuffer> presentCommandBuffers;
     GpuDevice device;
 };
 #endif // GPU_SURFACE_EXTENSION
@@ -247,6 +253,7 @@ struct VulkanInstance
         VulkanInstance* inst = new VulkanInstance();
 
         std::vector<const char*> requiredInstanceExtensions = {};
+        std::vector<const char*> optionalInstanceExtensions = {};
         inst->requiredDeviceExtensions = {
             VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
             VK_EXT_MESH_SHADER_EXTENSION_NAME,
@@ -258,8 +265,15 @@ struct VulkanInstance
 #ifdef _WIN32
         requiredInstanceExtensions.push_back("VK_KHR_win32_surface");
 #else
-        requiredInstanceExtensions.push_back(VK_KHR_DISPLAY_EXTENSION_NAME);
-        inst->requiredDeviceExtensions.push_back(VK_KHR_DISPLAY_SWAPCHAIN_EXTENSION_NAME);
+        // The window-system surface extension is platform dependent on Linux
+        // (Wayland / Xlib / Xcb). Enable whichever the running system provides
+        // instead of hard-requiring one. VK_KHR_display / VK_KHR_display_swapchain
+        // are for direct-to-display rendering and are not exposed by typical
+        // desktop drivers (e.g. Mesa RADV), so requiring them filters out every
+        // GPU and must not be done here.
+        optionalInstanceExtensions.push_back("VK_KHR_wayland_surface");
+        optionalInstanceExtensions.push_back("VK_KHR_xlib_surface");
+        optionalInstanceExtensions.push_back("VK_KHR_xcb_surface");
 #endif
         inst->requiredDeviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 #endif // GPU_SURFACE_EXTENSION
@@ -271,6 +285,21 @@ struct VulkanInstance
 #endif // GPU_RAY_TRACING_EXTENSION
 
         vkb::InstanceBuilder instanceBuilder;
+
+        // Enable optional instance extensions only when the running system
+        // exposes them (InstanceBuilder::enable_extensions hard-fails on a
+        // missing extension, so filter first via SystemInfo).
+        auto systemInfoRet = vkb::SystemInfo::get_system_info();
+        if (systemInfoRet.has_value())
+        {
+            for (const char* ext : optionalInstanceExtensions)
+            {
+                if (systemInfoRet->is_extension_available(ext))
+                {
+                    requiredInstanceExtensions.push_back(ext);
+                }
+            }
+        }
 
         auto instanceRet = instanceBuilder
             .request_validation_layers(true)
@@ -397,6 +426,7 @@ struct VulkanDevice
         physicalDeviceVulkan12Features.bufferDeviceAddress = VK_TRUE;
         physicalDeviceVulkan12Features.runtimeDescriptorArray = VK_TRUE;
         physicalDeviceVulkan12Features.shaderInt8 = VK_TRUE;
+        physicalDeviceVulkan12Features.storagePushConstant8 = VK_TRUE;
 
         vulkanDevice->physicalDevice.features.shaderInt64 = VK_TRUE;
 
@@ -1018,6 +1048,45 @@ GpuTextureSizeAlign gpuTextureSizeAlign(GpuDevice device, GpuTextureDesc desc)
     return { imageMemoryRequirements.size, imageMemoryRequirements.alignment };
 }
 
+// Records an image layout transition. Images are never used in UNDEFINED on
+// drivers that honour layouts (e.g. Mesa RADV), so every image access path
+// routes through here. Conservative ALL_COMMANDS stage / MEMORY access masks
+// keep this simple and hazard-free; it is a no-op when already in newLayout.
+static void transitionImageLayout(VulkanDevice* vulkanDevice, VkCommandBuffer cb, GpuTexture texture, VkImageLayout newLayout)
+{
+    if (texture->currentLayout == newLayout)
+    {
+        return;
+    }
+
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = texture->currentLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = texture->image;
+    barrier.subresourceRange.aspectMask = (texture->desc.usage & USAGE_DEPTH_STENCIL_ATTACHMENT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+    vulkanDevice->dispatchTable.cmdPipelineBarrier(
+        cb,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &barrier
+    );
+
+    texture->currentLayout = newLayout;
+}
+
 GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* ptrGpu)
 {
     VulkanDevice* vulkanDevice = device->vulkanDevice;
@@ -1044,7 +1113,42 @@ GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* ptrGpu)
     VkImageView imageView = VK_NULL_HANDLE;
     vulkanDevice->dispatchTable.createImageView(&viewInfo, nullptr, &imageView);
 
-    return new GpuTexture_T { desc, image, imageView, device};
+    GpuTexture texture = new GpuTexture_T { desc, image, imageView, device };
+
+    // Move the image out of UNDEFINED into its resting layout (GENERAL) right
+    // away with a one-shot submit. Leaving it UNDEFINED until first use causes a
+    // GPU hang on drivers that honour layouts (RADV); since this only runs at
+    // resource-creation time the synchronous submit is acceptable.
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = vulkanDevice->commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vulkanDevice->dispatchTable.allocateCommandBuffers(&allocInfo, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vulkanDevice->dispatchTable.beginCommandBuffer(cmd, &beginInfo);
+
+    transitionImageLayout(vulkanDevice, cmd, texture, VK_IMAGE_LAYOUT_GENERAL);
+
+    vulkanDevice->dispatchTable.endCommandBuffer(cmd);
+
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+
+    VkQueue queue = vulkanDevice->device.get_queue(vkb::QueueType::graphics).value();
+    vulkanDevice->dispatchTable.queueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vulkanDevice->dispatchTable.queueWaitIdle(queue);
+
+    vulkanDevice->dispatchTable.freeCommandBuffers(vulkanDevice->commandPool, 1, &cmd);
+
+    return texture;
 }
 
 void gpuDestroyTexture(GpuTexture texture)
@@ -1531,7 +1635,8 @@ void gpuCopyToTexture(GpuCommandBuffer cb, void* srcGpu, GpuTexture texture)
     region.imageOffset = { 0, 0, 0 };
     region.imageExtent = { texture->desc.dimensions.x, texture->desc.dimensions.y, texture->desc.dimensions.z };
 
-    vulkanDevice->dispatchTable.cmdCopyBufferToImage(cb->commandBuffer, src.buffer, texture->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    transitionImageLayout(vulkanDevice, cb->commandBuffer, texture, VK_IMAGE_LAYOUT_GENERAL);
+    vulkanDevice->dispatchTable.cmdCopyBufferToImage(cb->commandBuffer, src.buffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
 void gpuCopyFromTexture(GpuCommandBuffer cb, void* destGpu, GpuTexture texture)
@@ -1550,7 +1655,8 @@ void gpuCopyFromTexture(GpuCommandBuffer cb, void* destGpu, GpuTexture texture)
     region.imageOffset = { 0, 0, 0 };
     region.imageExtent = { texture->desc.dimensions.x, texture->desc.dimensions.y, texture->desc.dimensions.z };
 
-    vulkanDevice->dispatchTable.cmdCopyImageToBuffer(cb->commandBuffer, texture->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buffer, 1, &region);
+    transitionImageLayout(vulkanDevice, cb->commandBuffer, texture, VK_IMAGE_LAYOUT_GENERAL);
+    vulkanDevice->dispatchTable.cmdCopyImageToBuffer(cb->commandBuffer, texture->image, VK_IMAGE_LAYOUT_GENERAL, dst.buffer, 1, &region);
 }
 
 void gpuBlitTexture(GpuCommandBuffer cb, GpuTexture destTexture, GpuTexture srcTexture)
@@ -1570,12 +1676,14 @@ void gpuBlitTexture(GpuCommandBuffer cb, GpuTexture destTexture, GpuTexture srcT
     blit.dstOffsets[0] = { 0, 0, 0 };
     blit.dstOffsets[1] = { static_cast<int32_t>(destTexture->desc.dimensions.x), static_cast<int32_t>(destTexture->desc.dimensions.y), static_cast<int32_t>(destTexture->desc.dimensions.z) };
 
+    transitionImageLayout(vulkanDevice, cb->commandBuffer, srcTexture, VK_IMAGE_LAYOUT_GENERAL);
+    transitionImageLayout(vulkanDevice, cb->commandBuffer, destTexture, VK_IMAGE_LAYOUT_GENERAL);
     vulkanDevice->dispatchTable.cmdBlitImage(
         cb->commandBuffer,
         srcTexture->image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_GENERAL,
         destTexture->image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_GENERAL,
         1,
         &blit,
         VK_FILTER_NEAREST
@@ -1615,7 +1723,7 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void *ptrGpu)
         GpuPipeline currentPipeline = vulkanDevice->currentPipeline[cb];
         if (vulkanDevice->patchDescriptorsPipeline == nullptr)
         {
-            auto patchDescriptorsSpv = gpuHiddenLoadIR("../Shaders/PatchDescriptors.spv");
+            auto patchDescriptorsSpv = gpuHiddenLoadIR("Shaders/PatchDescriptors.spv");
             vulkanDevice->patchDescriptorsPipeline = gpuCreateComputePipeline(device, patchDescriptorsSpv);
         }
 
@@ -1873,6 +1981,15 @@ void gpuBeginRenderPass(GpuCommandBuffer cb, GpuRenderPassDesc desc)
     renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     renderingInfo.renderArea.offset = { 0, 0 };
 
+    for (const auto& colorTarget : desc.colorTargets)
+    {
+        transitionImageLayout(vulkanDevice, cb->commandBuffer, colorTarget, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (desc.depthStencilTarget != nullptr)
+    {
+        transitionImageLayout(vulkanDevice, cb->commandBuffer, desc.depthStencilTarget, VK_IMAGE_LAYOUT_GENERAL);
+    }
+
     std::vector<VkRenderingAttachmentInfo> colorAttachments;
     for (const auto& colorTarget : desc.colorTargets)
     {
@@ -1891,7 +2008,7 @@ void gpuBeginRenderPass(GpuCommandBuffer cb, GpuRenderPassDesc desc)
     {
         depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         depthAttachment.imageView = desc.depthStencilTarget->view;
-        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         depthAttachment.clearValue.depthStencil = { 1.0f, 0 };
@@ -2203,13 +2320,24 @@ GpuSwapchain gpuCreateSwapchain(GpuDevice device, GpuSurface surface, uint32_t i
         presentSemaphores.push_back(presentSemaphore);
     }
 
-    return new GpuSwapchain_T { 
-        swapchain.swapchain, 
-        presentQueue->queue, 
-        0, 
+    // One command buffer per swapchain image, used by gpuPresent to transition
+    // the image into PRESENT_SRC before presenting. Reused (reset) each frame.
+    std::vector<VkCommandBuffer> presentCommandBuffers(swapchainImages.size());
+    VkCommandBufferAllocateInfo presentCbAllocInfo = {};
+    presentCbAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    presentCbAllocInfo.commandPool = vulkanDevice->commandPool;
+    presentCbAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    presentCbAllocInfo.commandBufferCount = static_cast<uint32_t>(presentCommandBuffers.size());
+    vulkanDevice->dispatchTable.allocateCommandBuffers(&presentCbAllocInfo, presentCommandBuffers.data());
+
+    return new GpuSwapchain_T {
+        swapchain.swapchain,
+        presentQueue->queue,
+        0,
         desc,
-        swapchainImages, 
+        swapchainImages,
         presentSemaphores,
+        presentCommandBuffers,
         device
     };
 }
@@ -2217,6 +2345,18 @@ GpuSwapchain gpuCreateSwapchain(GpuDevice device, GpuSurface surface, uint32_t i
 void gpuDestroySwapchain(GpuSwapchain swapchain)
 {
     VulkanDevice* vulkanDevice = swapchain->device->vulkanDevice;
+    // Drain all queues (including the present queue) before freeing the
+    // swapchain's images, present semaphores and command buffers, which may
+    // still be referenced by in-flight presentation work.
+    vulkanDevice->dispatchTable.deviceWaitIdle();
+    if (!swapchain->presentCommandBuffers.empty())
+    {
+        vulkanDevice->dispatchTable.freeCommandBuffers(
+            vulkanDevice->commandPool,
+            static_cast<uint32_t>(swapchain->presentCommandBuffers.size()),
+            swapchain->presentCommandBuffers.data()
+        );
+    }
     for (auto image : swapchain->images)
     {
         vulkanDevice->dispatchTable.destroyImageView(image->view, nullptr);
@@ -2256,15 +2396,37 @@ GpuTexture gpuSwapchainImage(GpuSwapchain swapchain)
 void gpuPresent(GpuSwapchain swapchain, GpuSemaphore sema, uint64_t value)
 {
     VulkanDevice* vulkanDevice = swapchain->device->vulkanDevice;
+
+    // The presentation engine requires the image in PRESENT_SRC. Record that
+    // transition into this image's reusable command buffer; the prior present of
+    // this image has completed by the time it is re-acquired, so resetting is safe.
+    VkCommandBuffer transitionCmd = swapchain->presentCommandBuffers[swapchain->imageIndex];
+    vulkanDevice->dispatchTable.resetCommandBuffer(transitionCmd, 0);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vulkanDevice->dispatchTable.beginCommandBuffer(transitionCmd, &beginInfo);
+
+    transitionImageLayout(vulkanDevice, transitionCmd, swapchain->images[swapchain->imageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+    vulkanDevice->dispatchTable.endCommandBuffer(transitionCmd);
+
     VkSemaphoreSubmitInfo waitInfo = {};
     waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     waitInfo.semaphore = sema->semaphore;
     waitInfo.value = value;
+    waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkSemaphoreSubmitInfo signalInfo = {};
     signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
     signalInfo.semaphore = swapchain->presentSemaphores[swapchain->imageIndex];
     signalInfo.value = 0;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
+    VkCommandBufferSubmitInfo commandBufferInfo = {};
+    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    commandBufferInfo.commandBuffer = transitionCmd;
 
     VkSubmitInfo2 submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
@@ -2272,12 +2434,19 @@ void gpuPresent(GpuSwapchain swapchain, GpuSemaphore sema, uint64_t value)
     submitInfo.pWaitSemaphoreInfos = &waitInfo;
     submitInfo.signalSemaphoreInfoCount = 1;
     submitInfo.pSignalSemaphoreInfos = &signalInfo;
-    submitInfo.commandBufferInfoCount = 0;
-    submitInfo.pCommandBufferInfos = nullptr;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &commandBufferInfo;
 
-    // Converts the timeline semaphore to a binary semaphore so we can present
+    // Submit on the graphics queue, NOT the present queue: the transition command
+    // buffer is allocated from the graphics-family command pool, and a command
+    // buffer may only be submitted to a queue of its pool's family. On hardware
+    // where present and graphics are separate families this would otherwise be a
+    // spec violation. The binary semaphore signalled here is waited on by the
+    // present below — signalling on one queue and waiting on another is valid.
+    // Waits on the timeline value (the rendering work), transitions to PRESENT_SRC.
+    VkQueue graphicsQueue = vulkanDevice->device.get_queue(vkb::QueueType::graphics).value();
     vulkanDevice->dispatchTable.queueSubmit2(
-        swapchain->presentQueue,
+        graphicsQueue,
         1,
         &submitInfo,
         VK_NULL_HANDLE

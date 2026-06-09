@@ -134,8 +134,8 @@ void graphicsSample()
         .colorTargets = Span<ColorTarget>(colorTargets, 2)
     };
 
-    auto vertexIR = loadIR("../Shaders/Graphics/Vertex.spv");
-    auto pixelIR = loadIR("../Shaders/Graphics/Pixel.spv");
+    auto vertexIR = loadIR("Shaders/Graphics/Vertex.spv");
+    auto pixelIR = loadIR("Shaders/Graphics/Pixel.spv");
     auto pipeline = gpuCreateGraphicsPipeline(
         device,
         ByteSpan(vertexIR),
@@ -149,7 +149,7 @@ void graphicsSample()
     };
     GpuDepthStencilState depthState = gpuCreateDepthStencilState(depthDescState);
 
-    auto taaIR = loadIR("../Shaders/Common/TAA.spv");
+    auto taaIR = loadIR("Shaders/Common/TAA.spv");
     auto taaPipeline = gpuCreateComputePipeline(
         device,
         ByteSpan(taaIR)
@@ -344,11 +344,13 @@ void graphicsSample()
     gpuFreePipeline(pipeline);
     gpuFreePipeline(taaPipeline);
     gpuFreeDepthStencilState(depthState);
-    gpuDestroySemaphore(semaphore);
-    gpuDestroyQueue(queue);
+    // Destroy the swapchain first: it drains all queues (including the present
+    // queue), so the timeline semaphore is no longer in use when destroyed.
     gpuDestroySwapchain(swapchain);
     SDL_Gpu_DestroySurface(surface);
     SDL_DestroyWindow(window);
+    gpuDestroySemaphore(semaphore);
+    gpuDestroyQueue(queue);
 
     gpuDestroyDevice(device);
     gpuDestroyInstance();

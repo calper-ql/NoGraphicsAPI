@@ -42,9 +42,7 @@ void raytracingSample()
         return;
     }
 
-    SDL_DisplayID display = SDL_GetPrimaryDisplay();
-    const SDL_DisplayMode *displayMode = SDL_GetCurrentDisplayMode(display);
-    auto window = SDL_CreateWindow("Test Window", displayMode->w, displayMode->h, SDL_WINDOW_GPU | SDL_WINDOW_BORDERLESS);
+    auto window = SDL_CreateWindow("Test Window", 1920, 1080, SDL_WINDOW_GPU);
     auto surface = SDL_Gpu_CreateSurface(window);
     bool exit = false;
 
@@ -162,19 +160,19 @@ void raytracingSample()
     ColorTarget colorTarget = {};
     colorTarget.format = swapchainDesc.format;
 
-    auto referenceIR = loadIR("../Shaders/Raytracing/Raytracing.spv");
+    auto referenceIR = loadIR("Shaders/Raytracing/Raytracing.spv");
     auto referencePipeline = gpuCreateComputePipeline(device, ByteSpan(referenceIR));
 
-    auto risIR = loadIR("../Shaders/Raytracing/RIS.spv");
+    auto risIR = loadIR("Shaders/Raytracing/RIS.spv");
     auto risPipeline = gpuCreateComputePipeline(device, ByteSpan(risIR));
 
-    auto reuseIR = loadIR("../Shaders/Raytracing/Reuse.spv");
+    auto reuseIR = loadIR("Shaders/Raytracing/Reuse.spv");
     auto reusePipeline = gpuCreateComputePipeline(device, ByteSpan(reuseIR));
 
-    auto shadeIR = loadIR("../Shaders/Raytracing/Shade.spv");
+    auto shadeIR = loadIR("Shaders/Raytracing/Shade.spv");
     auto shadePipeline = gpuCreateComputePipeline(device, ByteSpan(shadeIR));
 
-    auto taaIR = loadIR("../Shaders/Common/TAA.spv");
+    auto taaIR = loadIR("Shaders/Common/TAA.spv");
     auto taaPipeline = gpuCreateComputePipeline(device, ByteSpan(taaIR));
 
     auto taaData = allocator.allocate<TAAData>();
@@ -389,7 +387,9 @@ void raytracingSample()
     std::string fpsString = "0";
     auto timestamp = std::chrono::high_resolution_clock::now();
 
-    TextRenderer* textRenderer = new TextRenderer(device, outputTextureDesc);
+    // Text is drawn onto the swapchain image, so the renderer's pipeline must
+    // use the swapchain's format/dimensions (not the float RT output texture).
+    TextRenderer* textRenderer = new TextRenderer(device, swapchainDesc);
 
     while (!exit)
     {
@@ -564,6 +564,11 @@ void raytracingSample()
             gpuBlitTexture(commandBuffer, image, outputTexture);
         }
 
+        // The text pass loads (LOAD_OP_LOAD) and writes the swapchain image that
+        // was just written by the blit above; order the transfer write before the
+        // color-attachment access so the blitted pixels are not raced.
+        gpuBarrier(commandBuffer, STAGE_TRANSFER, STAGE_RASTER_COLOR_OUT);
+
         // Render text to swapchain image
         smoothedFps = glm::mix(smoothedFps, 1.0f / delta, 0.05f);
         fpsUpdateTimer += delta;
@@ -618,10 +623,18 @@ void raytracingSample()
     gpuFree(device, texturePtr);
     gpuDestroyTexture(outputTexture);
     gpuFree(device, outputTexturePtr);
+    gpuDestroyTexture(albedoTexture);
+    gpuFree(device, albedoTexturePtr);
+    gpuDestroyTexture(normalsTexture);
+    gpuFree(device, normalsTexturePtr);
+    gpuDestroyTexture(motionVectorsTexture);
+    gpuFree(device, motionVectorsTexturePtr);
     gpuDestroyTexture(taaOutputTexture);
     gpuFree(device, taaOutputTexturePtr);
     gpuDestroyTexture(historyTexture);
     gpuFree(device, historyTexturePtr);
+    gpuFree(device, pixelSample);
+    gpuFree(device, prevPixelSample);
     gpuFreePipeline(referencePipeline);
     gpuFreePipeline(risPipeline);
     gpuFreePipeline(reusePipeline);
@@ -632,12 +645,14 @@ void raytracingSample()
     gpuDestroyAccelerationStructure(tlas);
     gpuFree(device, tlasPtr);
     gpuFree(device, scratchPtr);
-    gpuDestroySemaphore(semaphore);
-    gpuDestroyQueue(queue);
+    // Destroy the swapchain first: it drains all queues (including the present
+    // queue), so the timeline semaphore is no longer in use when destroyed.
     gpuDestroySwapchain(swapchain);
     SDL_Gpu_DestroySurface(surface);
     SDL_DestroyWindow(window);
     SDL_Quit();
+    gpuDestroySemaphore(semaphore);
+    gpuDestroyQueue(queue);
 
     gpuDestroyDevice(device);
     gpuDestroyInstance();

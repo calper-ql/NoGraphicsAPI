@@ -256,7 +256,8 @@ private:
 
     GpuDevice device;
     GpuPipeline pipeline;
-    
+    GpuDepthStencilState depthStencilState;
+
     Allocation<GpuTextureDescriptor> textureHeap;
     Allocation<TextVertexData> vertexData;
     Allocation<TextPixelData> pixelData;
