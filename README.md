@@ -11,7 +11,23 @@ The project started with the original header from the blog post, and built from 
 
 To see what the API looks like in practice, check out the [samples](https://github.com/LeftHandDev/NoGraphicsAPI/tree/main/samples). For simple usage of the API, see below.
 
-## Building
+## Using NGA in your project
+
+The reusable library is the self-contained [`nga/`](nga/) folder. Add this
+repo (or just that folder) as a submodule, a copy, or via FetchContent, then:
+
+```cmake
+add_subdirectory(path/to/NoGraphicsAPI)   # or just the nga/ folder, or include(<path>/nga/nga.cmake)
+target_link_libraries(your_app PRIVATE nga::nga)
+```
+
+That's it — samples and tests build only when NGA is the top-level project,
+the one library dependency (vk-bootstrap) resolves itself (submodule or
+automatic download), and no shader compiler is required to build the library.
+You only need CMake 3.22+, a C++20 compiler and Vulkan. See
+[nga/README.md](nga/README.md) for the details.
+
+## Building the samples
 
 Clone with submodules (or initialize them afterwards):
 
@@ -117,7 +133,7 @@ int main()
 
 ## Window Usage
 
-Include `window.h` to create a window and Vulkan surface through the selected windowing backend (GLFW or SDL3).
+Include `window.h` to create a window and Vulkan surface through the selected windowing backend (GLFW or SDL3). Note that `window.h` is part of this repo's sample scaffolding ([`platform/`](platform/)), not the embeddable `nga/` library — in your own project, create the window and `VkSurfaceKHR` with your windowing library of choice and hand the surface to `gpuCreateSurface()`.
 
 ```c++
 #include "window.h"
@@ -224,17 +240,19 @@ PixelOut main(PixelIn pixel, VertexData* _, PixelData* data)
 
 Raytracing pipelines and acceleration structures are not mentioned in the original header, so some liberties had to be taken in the API design. Since raytracing pipelines are not required to trace rays, for now they are not implemented.
 
-To trace rays, simply create and build acceleration structures, and then pass the TLAS gpu pointer to a shader and use ray query. See the [Raytracing.cpp](https://github.com/LeftHandDev/NoGraphicsAPI/blob/main/Samples/Raytracing/Raytracing.cpp) sample for an example.
+To trace rays, simply create and build acceleration structures, and then pass the TLAS gpu pointer to a shader and use ray query. See the [Raytracing.cpp](https://github.com/LeftHandDev/NoGraphicsAPI/blob/main/samples/raytracing/Raytracing.cpp) sample for an example.
 
 ## Dependencies
 
-Fetched as git submodules under `external/` and built from source — nothing to install:
+The library itself ([`nga/`](nga/)) depends only on Vulkan and
+[vk-bootstrap](https://github.com/charles-lunarg/vk-bootstrap) (a submodule,
+auto-downloaded if missing). The rest is samples/tests-only, fetched as git
+submodules under `external/` and built from source — nothing to install:
 - [GLFW](https://github.com/glfw/glfw) and [SDL3](https://github.com/libsdl-org/SDL) — windowing (pick one via `NGA_WINDOW_BACKEND`)
 - [GLM](https://github.com/g-truc/glm) — math
-- [vk-bootstrap](https://github.com/charles-lunarg/vk-bootstrap) — Vulkan instance/device setup
 
 Vendored in the repo:
 - [stb_image & stb_image_write](https://github.com/nothings/stb/tree/master)
 
 Must be installed separately (the one prerequisite):
-- [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) — Vulkan loader/headers and the `slangc` shader compiler
+- [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) — Vulkan loader/headers, plus the `slangc` shader compiler used by the samples and tests (the library itself does not need it)
