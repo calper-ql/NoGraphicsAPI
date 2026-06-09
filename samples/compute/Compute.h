@@ -1,7 +1,7 @@
 #ifndef SAMPLES_SHADER_COMPUTE_H
 #define SAMPLES_SHADER_COMPUTE_H
 
-#include "Sampler.h" // software sampler library; includes NoGraphicsAPI.h
+#include "NoGraphicsAPI.h"
 
 // A plain data struct kept in its own GPU buffer. ComputeData below holds a
 // pointer to an array of these; the shader follows that pointer to read them.

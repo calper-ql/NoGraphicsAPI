@@ -1,7 +1,11 @@
 #ifndef NO_GRAPHICS_API_SAMPLER_H
 #define NO_GRAPHICS_API_SAMPLER_H
 
-#include "NoGraphicsAPI.h"
+// Part of NoGraphicsAPI.h (which includes this at the end) — not a standalone
+// header. It relies on the shared types and shader globals defined there.
+#ifndef NO_GRAPHICS_API_H
+#error "Include NoGraphicsAPI.h instead of Sampler.h"
+#endif
 
 // A sampler is plain data plus shader code — not an API object and not a
 // descriptor. Following the blog post, declare one inline in GPU code:

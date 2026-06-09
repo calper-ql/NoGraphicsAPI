@@ -23,4 +23,7 @@ SamplerState samplerHeap[];
 
 #endif
 
+// Software samplers: plain-data sampler state with shader-code filtering.
+#include "Sampler.h"
+
 #endif // NO_GRAPHICS_API_H
