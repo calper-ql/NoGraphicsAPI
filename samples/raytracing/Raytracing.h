@@ -18,7 +18,7 @@ struct alignas(16) PrimitiveData
 
 struct alignas(16) MeshData
 {
-    PrimitiveData *primitives;
+    PrimitiveData* primitives;
 };
 
 struct alignas(16) LightData
@@ -133,7 +133,7 @@ float3 Le(Path x, LightData* lights)
     {
         return float3(0.0, 0.0, 0.0);
     }
-    
+
     LightData light = lights[x.light];
     return light.color.xyz * light.intensity;
 }
@@ -149,7 +149,7 @@ float G(Path x, float3 normal)
 }
 
 float p(Path x, float3 albedo, float3 normal, LightData* lights)
-{ 
+{
     return length(albedo * BRDF() * Le(x, lights) * G(x, normal));
 }
 

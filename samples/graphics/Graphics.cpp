@@ -52,7 +52,7 @@ int main()
         .format = FORMAT_D32_FLOAT,
         .usage = static_cast<USAGE_FLAGS>(USAGE_DEPTH_STENCIL_ATTACHMENT | USAGE_SAMPLED)
     };
-    
+
     GpuTextureSizeAlign depthSizeAlign = gpuTextureSizeAlign(device, depthDesc);
     void* depthPtr = gpuMalloc(device, depthSizeAlign.size, MEMORY_GPU);
     auto depthTexture = gpuCreateTexture(device, depthDesc, depthPtr);
@@ -117,7 +117,7 @@ int main()
 
     // Texture Heap
     auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);
-    textureHeap.cpu[HeapIndices::INDEX_CUBE] = gpuTextureViewDescriptor(texture, GpuViewDesc{.format = textureDesc.format });
+    textureHeap.cpu[HeapIndices::INDEX_CUBE] = gpuTextureViewDescriptor(texture, GpuViewDesc{ .format = textureDesc.format });
     textureHeap.cpu[HeapIndices::INDEX_CURRENT_FRAME] = gpuTextureViewDescriptor(rasterOutputGpu, GpuViewDesc{ .format = rasterOutputDesc.format });
     textureHeap.cpu[HeapIndices::INDEX_HISTORY] = gpuTextureViewDescriptor(historyTextureGpu, GpuViewDesc{ .format = historyTexture.format });
     textureHeap.cpu[HeapIndices::INDEX_DEPTH] = gpuTextureViewDescriptor(depthTexture, GpuViewDesc{ .format = depthDesc.format });
@@ -140,8 +140,7 @@ int main()
         device,
         ByteSpan(vertexIR),
         ByteSpan(pixelIR),
-        rasterDesc
-    );
+        rasterDesc);
 
     GpuDepthStencilDesc depthDescState = {
         .depthMode = static_cast<DEPTH_FLAGS>(DEPTH_READ | DEPTH_WRITE),
@@ -152,8 +151,7 @@ int main()
     auto taaIR = loadIR("shaders/common/TAA.spv");
     auto taaPipeline = gpuCreateComputePipeline(
         device,
-        ByteSpan(taaIR)
-    );
+        ByteSpan(taaIR));
 
     std::vector<float3> cubeVertices;
     std::vector<float3> cubeNormals;
@@ -293,7 +291,7 @@ int main()
         yRotation += 0.0001f;
         auto instance0 = glm::translate(glm::mat4(1.f), translation) * glm::rotate(glm::mat4(1.f), xRotation, glm::vec3(1.0f, 0.0f, 0.0f));
         auto instance1 = glm::translate(glm::mat4(1.f), -translation) * glm::rotate(glm::mat4(1.f), yRotation, glm::vec3(0.0f, 1.0f, 0.0f));
-        
+
         // copy current model to previous model
         memcpy(&instances.cpu[0].prevModel, &instances.cpu[0].model, sizeof(float4x4));
         memcpy(&instances.cpu[1].prevModel, &instances.cpu[1].model, sizeof(float4x4));

@@ -5,9 +5,9 @@
 #include <cstring>
 #include <iostream>
 
-std::vector<uint8_t> loadIR(const std::filesystem::path &path)
+std::vector<uint8_t> loadIR(const std::filesystem::path& path)
 {
-    std::ifstream file { path, std::ios::binary | std::ios::ate };
+    std::ifstream file{ path, std::ios::binary | std::ios::ate };
     if (!file.is_open())
     {
         std::cerr << "loadIR: failed to open shader IR '" << path.string()
@@ -26,97 +26,115 @@ std::vector<uint8_t> loadIR(const std::filesystem::path &path)
     return buffer;
 }
 
-void getCube(std::vector<float3> &vertices, std::vector<float3> &normals, std::vector<float2> &uvs, std::vector<uint32_t> &indices)
+void getCube(std::vector<float3>& vertices, std::vector<float3>& normals, std::vector<float2>& uvs, std::vector<uint32_t>& indices)
 {
     // 24 vertices: 4 per face × 6 faces, each with correct face normal
     vertices = {
         // Front face (z = -1)
         { -1.0f, -1.0f, -1.0f },
-        {  1.0f, -1.0f, -1.0f },
-        {  1.0f,  1.0f, -1.0f },
-        { -1.0f,  1.0f, -1.0f },
+        { 1.0f, -1.0f, -1.0f },
+        { 1.0f, 1.0f, -1.0f },
+        { -1.0f, 1.0f, -1.0f },
         // Back face (z = +1)
-        {  1.0f, -1.0f,  1.0f },
-        { -1.0f, -1.0f,  1.0f },
-        { -1.0f,  1.0f,  1.0f },
-        {  1.0f,  1.0f,  1.0f },
+        { 1.0f, -1.0f, 1.0f },
+        { -1.0f, -1.0f, 1.0f },
+        { -1.0f, 1.0f, 1.0f },
+        { 1.0f, 1.0f, 1.0f },
         // Left face (x = -1)
-        { -1.0f, -1.0f,  1.0f },
+        { -1.0f, -1.0f, 1.0f },
         { -1.0f, -1.0f, -1.0f },
-        { -1.0f,  1.0f, -1.0f },
-        { -1.0f,  1.0f,  1.0f },
+        { -1.0f, 1.0f, -1.0f },
+        { -1.0f, 1.0f, 1.0f },
         // Right face (x = +1)
-        {  1.0f, -1.0f, -1.0f },
-        {  1.0f, -1.0f,  1.0f },
-        {  1.0f,  1.0f,  1.0f },
-        {  1.0f,  1.0f, -1.0f },
+        { 1.0f, -1.0f, -1.0f },
+        { 1.0f, -1.0f, 1.0f },
+        { 1.0f, 1.0f, 1.0f },
+        { 1.0f, 1.0f, -1.0f },
         // Bottom face (y = -1)
-        { -1.0f, -1.0f,  1.0f },
-        {  1.0f, -1.0f,  1.0f },
-        {  1.0f, -1.0f, -1.0f },
+        { -1.0f, -1.0f, 1.0f },
+        { 1.0f, -1.0f, 1.0f },
+        { 1.0f, -1.0f, -1.0f },
         { -1.0f, -1.0f, -1.0f },
         // Top face (y = +1)
-        { -1.0f,  1.0f, -1.0f },
-        {  1.0f,  1.0f, -1.0f },
-        {  1.0f,  1.0f,  1.0f },
-        { -1.0f,  1.0f,  1.0f },
+        { -1.0f, 1.0f, -1.0f },
+        { 1.0f, 1.0f, -1.0f },
+        { 1.0f, 1.0f, 1.0f },
+        { -1.0f, 1.0f, 1.0f },
     };
 
     normals = {
         // Front face
-        {  0.0f,  0.0f, -1.0f },
-        {  0.0f,  0.0f, -1.0f },
-        {  0.0f,  0.0f, -1.0f },
-        {  0.0f,  0.0f, -1.0f },
+        { 0.0f, 0.0f, -1.0f },
+        { 0.0f, 0.0f, -1.0f },
+        { 0.0f, 0.0f, -1.0f },
+        { 0.0f, 0.0f, -1.0f },
         // Back face
-        {  0.0f,  0.0f,  1.0f },
-        {  0.0f,  0.0f,  1.0f },
-        {  0.0f,  0.0f,  1.0f },
-        {  0.0f,  0.0f,  1.0f },
+        { 0.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, 1.0f },
         // Left face
-        { -1.0f,  0.0f,  0.0f },
-        { -1.0f,  0.0f,  0.0f },
-        { -1.0f,  0.0f,  0.0f },
-        { -1.0f,  0.0f,  0.0f },
+        { -1.0f, 0.0f, 0.0f },
+        { -1.0f, 0.0f, 0.0f },
+        { -1.0f, 0.0f, 0.0f },
+        { -1.0f, 0.0f, 0.0f },
         // Right face
-        {  1.0f,  0.0f,  0.0f },
-        {  1.0f,  0.0f,  0.0f },
-        {  1.0f,  0.0f,  0.0f },
-        {  1.0f,  0.0f,  0.0f },
+        { 1.0f, 0.0f, 0.0f },
+        { 1.0f, 0.0f, 0.0f },
+        { 1.0f, 0.0f, 0.0f },
+        { 1.0f, 0.0f, 0.0f },
         // Bottom face
-        {  0.0f, -1.0f,  0.0f },
-        {  0.0f, -1.0f,  0.0f },
-        {  0.0f, -1.0f,  0.0f },
-        {  0.0f, -1.0f,  0.0f },
+        { 0.0f, -1.0f, 0.0f },
+        { 0.0f, -1.0f, 0.0f },
+        { 0.0f, -1.0f, 0.0f },
+        { 0.0f, -1.0f, 0.0f },
         // Top face
-        {  0.0f,  1.0f,  0.0f },
-        {  0.0f,  1.0f,  0.0f },
-        {  0.0f,  1.0f,  0.0f },
-        {  0.0f,  1.0f,  0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
     };
 
     uvs = {
         // Front face
-        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 0.0f },
         // Back face
-        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 0.0f },
         // Left face
-        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 0.0f },
         // Right face
-        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 0.0f },
         // Bottom face
-        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 0.0f },
         // Top face
-        { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f }, { 0.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 0.0f },
     };
 
     indices = {
-         0,  1,  2,  2,  3,  0,  // Front
-         4,  5,  6,  6,  7,  4,  // Back
-         8,  9, 10, 10, 11,  8,  // Left
-        12, 13, 14, 14, 15, 12,  // Right
-        16, 17, 18, 18, 19, 16,  // Bottom
-        20, 21, 22, 22, 23, 20,  // Top
+        0, 1, 2, 2, 3, 0,       // Front
+        4, 5, 6, 6, 7, 4,       // Back
+        8, 9, 10, 10, 11, 8,    // Left
+        12, 13, 14, 14, 15, 12, // Right
+        16, 17, 18, 18, 19, 16, // Bottom
+        20, 21, 22, 22, 23, 20, // Top
     };
 }
 
@@ -175,7 +193,7 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
     depthStencilState = gpuCreateDepthStencilState(GpuDepthStencilDesc{});
 
     std::vector<uint32_t> indices = { 0, 1, 2, 2, 3, 0 };
-    
+
     vertexData = allocator->allocate<TextVertexData>();
     pixelData = allocator->allocate<TextPixelData>();
     indexData = allocator->allocate<uint32_t>(6);
@@ -192,9 +210,10 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
 
         GpuTextureDesc atlasDesc{
             .type = TEXTURE_2D,
-            .dimensions = {static_cast<uint32_t>(atlasWidth), static_cast<uint32_t>(atlasHeight), 1},
+            .dimensions = { static_cast<uint32_t>(atlasWidth), static_cast<uint32_t>(atlasHeight), 1 },
             .format = FORMAT_RGBA8_UNORM,
-            .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+            .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)
+        };
 
         GpuTextureSizeAlign atlasSizeAlign = gpuTextureSizeAlign(device, atlasDesc);
         atlasPtr = gpuMalloc(device, atlasSizeAlign.size, MEMORY_GPU);
@@ -203,7 +222,7 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
         auto semaphore = gpuCreateSemaphore(device, 0);
         auto queue = gpuCreateQueue(device);
         auto cmd = gpuStartCommandRecording(queue);
-        
+
         gpuCopyToTexture(cmd, atlasUpload.gpu, atlas);
 
         gpuSubmit(queue, Span<GpuCommandBuffer>(&cmd, 1), semaphore, 1);
@@ -213,7 +232,7 @@ TextRenderer::TextRenderer(GpuDevice gpuDevice, GpuTextureDesc textureDesc)
         stbi_image_free(atlasData);
 
         textureHeap = allocator->allocate<GpuTextureDescriptor>(1024);
-        textureHeap.cpu[0] = gpuTextureViewDescriptor(atlas, GpuViewDesc{.format = FORMAT_RGBA8_UNORM});
+        textureHeap.cpu[0] = gpuTextureViewDescriptor(atlas, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
     }
 }
 
@@ -227,7 +246,7 @@ TextRenderer::~TextRenderer()
     delete allocator;
 }
 
-void TextRenderer::renderText(GpuCommandBuffer cmd, GpuTexture target, const std::string &text, float x, float y, float scale, float3 color)
+void TextRenderer::renderText(GpuCommandBuffer cmd, GpuTexture target, const std::string& text, float x, float y, float scale, float3 color)
 {
     if (offset + text.size() > maxTextLength)
     {

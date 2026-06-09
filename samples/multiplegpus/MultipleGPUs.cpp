@@ -13,7 +13,7 @@ int main()
     {
         auto device = gpuCreateDevice(i);
         auto desc = gpuDeviceDesc(i);
-        devices.push_back({device, desc});
+        devices.push_back({ device, desc });
     }
 
     // 1 MB round trip transfer test for each device

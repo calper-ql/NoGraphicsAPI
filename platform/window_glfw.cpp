@@ -20,17 +20,28 @@ namespace nga
     {
         switch (key)
         {
-            case Key::A:      return GLFW_KEY_A;
-            case Key::S:      return GLFW_KEY_S;
-            case Key::T:      return GLFW_KEY_T;
-            case Key::R:      return GLFW_KEY_R;
-            case Key::X:      return GLFW_KEY_X;
-            case Key::Escape: return GLFW_KEY_ESCAPE;
-            case Key::Up:     return GLFW_KEY_UP;
-            case Key::Down:   return GLFW_KEY_DOWN;
-            case Key::Left:   return GLFW_KEY_LEFT;
-            case Key::Right:  return GLFW_KEY_RIGHT;
-            default:          return GLFW_KEY_UNKNOWN;
+        case Key::A:
+            return GLFW_KEY_A;
+        case Key::S:
+            return GLFW_KEY_S;
+        case Key::T:
+            return GLFW_KEY_T;
+        case Key::R:
+            return GLFW_KEY_R;
+        case Key::X:
+            return GLFW_KEY_X;
+        case Key::Escape:
+            return GLFW_KEY_ESCAPE;
+        case Key::Up:
+            return GLFW_KEY_UP;
+        case Key::Down:
+            return GLFW_KEY_DOWN;
+        case Key::Left:
+            return GLFW_KEY_LEFT;
+        case Key::Right:
+            return GLFW_KEY_RIGHT;
+        default:
+            return GLFW_KEY_UNKNOWN;
         }
     }
 
@@ -100,4 +111,4 @@ namespace nga
     {
         return window->pressed[static_cast<size_t>(key)];
     }
-}
+} // namespace nga

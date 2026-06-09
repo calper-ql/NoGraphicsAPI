@@ -11,7 +11,7 @@
 
 #include "Text.h"
 
-template<typename T>
+template <typename T>
 struct Allocation
 {
     T* cpu;
@@ -23,11 +23,10 @@ struct Allocation
     }
 };
 
-template<MEMORY memory = MEMORY_DEFAULT>
+template <MEMORY memory = MEMORY_DEFAULT>
 class LinearAllocator
 {
 public:
-
     LinearAllocator(GpuDevice gpuDevice, size_t pageSize = 65536)
         : device(gpuDevice), pageSize(pageSize)
     {
@@ -44,7 +43,7 @@ public:
         return allocate<uint8_t>(size, align).cpu;
     }
 
-    template<typename T>
+    template <typename T>
     Allocation<T> allocate(size_t count = 1, size_t align = GPU_DEFAULT_ALIGNMENT)
     {
         size_t totalBytes = count * sizeof(T);
@@ -96,11 +95,10 @@ public:
     }
 
 private:
-
     struct Page
     {
-        void*  basePtr;
-        void*  baseGpuPtr;
+        void* basePtr;
+        void* baseGpuPtr;
         size_t size;
         size_t used;
     };
@@ -112,7 +110,7 @@ private:
         pages.push_back({ ptr, gpuPtr, size, 0 });
     }
 
-    template<typename T>
+    template <typename T>
     Allocation<T> allocateLarge(size_t totalBytes, size_t align)
     {
         size_t allocSize = totalBytes + align;
@@ -140,7 +138,10 @@ private:
         };
     }
 
-    bool isGpuOnly() const { return memory == MEMORY_GPU; }
+    bool isGpuOnly() const
+    {
+        return memory == MEMORY_GPU;
+    }
 
     GpuDevice device;
     size_t pageSize;
@@ -151,7 +152,6 @@ private:
 class RingBuffer
 {
 public:
-
     RingBuffer(GpuDevice gpuDevice, size_t size, MEMORY memory = MEMORY_DEFAULT)
         : device(gpuDevice), totalSize(size), memory(memory)
     {
@@ -171,7 +171,7 @@ public:
         free();
     }
 
-    template<typename T>
+    template <typename T>
     Allocation<T> allocate(size_t count = 1, size_t align = GPU_DEFAULT_ALIGNMENT)
     {
         size_t totalBytes = count * sizeof(T);
@@ -184,8 +184,8 @@ public:
 
         size_t newHead = alignedHead + totalBytes;
         size_t usedAfter = newHead > tail
-            ? newHead - tail
-            : (totalSize - tail) + newHead;
+                               ? newHead - tail
+                               : (totalSize - tail) + newHead;
 
         if (usedAfter > totalSize)
         {
@@ -215,14 +215,16 @@ public:
 
     void releaseFrame()
     {
-        if (frameMarkers.empty()) return;
+        if (frameMarkers.empty())
+            return;
         tail = frameMarkers.front();
         frameMarkers.erase(frameMarkers.begin());
     }
 
     void free()
     {
-        if (basePtr == nullptr) return;
+        if (basePtr == nullptr)
+            return;
         gpuFree(device, basePtr);
         basePtr = nullptr;
         baseGpuPtr = nullptr;
@@ -251,7 +253,6 @@ public:
     void renderText(GpuCommandBuffer cmd, GpuTexture target, const std::string& text, float x, float y, float scale, float3 color);
 
 private:
-
     LinearAllocator<MEMORY_DEFAULT>* allocator = nullptr;
 
     GpuDevice device;

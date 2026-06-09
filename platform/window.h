@@ -9,9 +9,16 @@ namespace nga
 {
     enum class Key
     {
-        A, S, T, R, X,
+        A,
+        S,
+        T,
+        R,
+        X,
         Escape,
-        Up, Down, Left, Right,
+        Up,
+        Down,
+        Left,
+        Right,
         Count
     };
 
@@ -36,6 +43,6 @@ namespace nga
     // wasKeyPressed == transitioned to down on the most recent pollEvents().
     bool isKeyDown(Window* window, Key key);
     bool wasKeyPressed(Window* window, Key key);
-}
+} // namespace nga
 
 #endif // NGA_WINDOW_H

@@ -1,7 +1,6 @@
 #include "Raytracing.h"
 
-[numthreads(8, 8, 1)]
-void RIS(uint3 threadId: SV_DispatchThreadID, RaytracingData *data)
+[numthreads(8, 8, 1)] void RIS(uint3 threadId : SV_DispatchThreadID, RaytracingData* data)
 {
     RWTexture2D<float4> outputTexture = rwTextureHeap[data->dstTexture];
 
@@ -150,8 +149,7 @@ void RIS(uint3 threadId: SV_DispatchThreadID, RaytracingData *data)
     // outputTexture[threadId.xy] = float4(debug, 1.0);
 }
 
-[numthreads(8, 8, 1)]
-void Reuse(uint3 threadId: SV_DispatchThreadID, RaytracingData *data)
+    [numthreads(8, 8, 1)] void Reuse(uint3 threadId : SV_DispatchThreadID, RaytracingData* data)
 {
     RWTexture2D<float4> outputTexture = rwTextureHeap[data->dstTexture];
 
@@ -258,8 +256,7 @@ void Reuse(uint3 threadId: SV_DispatchThreadID, RaytracingData *data)
     data->pixelSample[q] = cur;
 }
 
-[numthreads(8, 8, 1)]
-void Shade(uint3 threadId: SV_DispatchThreadID, RaytracingData *data)
+[numthreads(8, 8, 1)] void Shade(uint3 threadId : SV_DispatchThreadID, RaytracingData* data)
 {
     RWTexture2D<float4> outputTexture = rwTextureHeap[data->dstTexture];
 

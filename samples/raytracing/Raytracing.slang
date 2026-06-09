@@ -1,7 +1,6 @@
 #include "Raytracing.h"
 
-[numthreads(8, 8, 1)]
-void main(uint3 threadId: SV_DispatchThreadID, RaytracingData *data)
+[numthreads(8, 8, 1)] void main(uint3 threadId : SV_DispatchThreadID, RaytracingData* data)
 {
     RWTexture2D<float4> outputTexture = rwTextureHeap[data->dstTexture];
 

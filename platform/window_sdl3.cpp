@@ -22,17 +22,28 @@ namespace nga
     {
         switch (key)
         {
-            case SDLK_A:      return static_cast<int>(Key::A);
-            case SDLK_S:      return static_cast<int>(Key::S);
-            case SDLK_T:      return static_cast<int>(Key::T);
-            case SDLK_R:      return static_cast<int>(Key::R);
-            case SDLK_X:      return static_cast<int>(Key::X);
-            case SDLK_ESCAPE: return static_cast<int>(Key::Escape);
-            case SDLK_UP:     return static_cast<int>(Key::Up);
-            case SDLK_DOWN:   return static_cast<int>(Key::Down);
-            case SDLK_LEFT:   return static_cast<int>(Key::Left);
-            case SDLK_RIGHT:  return static_cast<int>(Key::Right);
-            default:          return -1;
+        case SDLK_A:
+            return static_cast<int>(Key::A);
+        case SDLK_S:
+            return static_cast<int>(Key::S);
+        case SDLK_T:
+            return static_cast<int>(Key::T);
+        case SDLK_R:
+            return static_cast<int>(Key::R);
+        case SDLK_X:
+            return static_cast<int>(Key::X);
+        case SDLK_ESCAPE:
+            return static_cast<int>(Key::Escape);
+        case SDLK_UP:
+            return static_cast<int>(Key::Up);
+        case SDLK_DOWN:
+            return static_cast<int>(Key::Down);
+        case SDLK_LEFT:
+            return static_cast<int>(Key::Left);
+        case SDLK_RIGHT:
+            return static_cast<int>(Key::Right);
+        default:
+            return -1;
         }
     }
 
@@ -119,4 +130,4 @@ namespace nga
     {
         return window->pressed[static_cast<size_t>(key)];
     }
-}
+} // namespace nga

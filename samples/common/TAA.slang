@@ -1,7 +1,6 @@
 #include "TAA.h"
 
-[numthreads(16, 16, 1)]
-void main(uint3 threadId : SV_DispatchThreadID, TAAData* data)
+[numthreads(16, 16, 1)] void main(uint3 threadId : SV_DispatchThreadID, TAAData* data)
 {
     uint width = data->width;
     uint height = data->height;
@@ -20,7 +19,7 @@ void main(uint3 threadId : SV_DispatchThreadID, TAAData* data)
     // Sample 3x3 neighborhood to find min/max bounds
     float4 neighborMin = color;
     float4 neighborMax = color;
-    
+
     for (int y = -1; y <= 1; y++)
     {
         for (int x = -1; x <= 1; x++)
@@ -42,10 +41,10 @@ void main(uint3 threadId : SV_DispatchThreadID, TAAData* data)
                    reprojectedUV.y >= 0.0 && reprojectedUV.y <= 1.0;
 
     float blendFactor = 0.05;
-    
+
     if (data->frame == 0 || !validUV)
     {
-        blendFactor = 1.0; 
+        blendFactor = 1.0;
     }
 
     float4 finalColor = lerp(historyColor, color, blendFactor);

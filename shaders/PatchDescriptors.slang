@@ -1,7 +1,6 @@
 #include "./PatchDescriptors.h"
 
-[numthreads(16, 1, 1)]
-void main(uint3 threadId: SV_DispatchThreadID, PatchDescriptorsData* data)
+[numthreads(16, 1, 1)] void main(uint3 threadId : SV_DispatchThreadID, PatchDescriptorsData* data)
 {
     uint index = threadId.x;
     if (index >= data->numDescriptors)

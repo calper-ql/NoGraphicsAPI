@@ -9,7 +9,7 @@
 #define GPU_DEFAULT_ALIGNMENT 16
 
 #define GPU_DEFINE_HANDLE(object) \
-    struct object##_T; \
+    struct object##_T;            \
     using object = object##_T*;
 
 // Vector types
@@ -19,21 +19,54 @@
 // declarations, so anonymous structs named only via `using` have no linkage
 // there, which makes API functions taking them by value fail to link. Named
 // structs have linkage on every compiler while preserving the same layout.
-struct int2 { int x, y; };
-struct int3 { int x, y, z; };
-struct int4 { int x, y, z, w; };
+struct int2
+{
+    int x, y;
+};
+struct int3
+{
+    int x, y, z;
+};
+struct int4
+{
+    int x, y, z, w;
+};
 using uint = uint32_t;
-struct uint2 { uint x, y; };
-struct uint3 { uint x, y, z; };
-struct uint4 { uint x, y, z, w; };
-struct float2 { float x, y; };
-struct float3 { float x, y, z; };
-struct float4 { float x, y, z, w; };
-struct float3x4 { float4 row0, row1, row2; };
-struct float4x4 { float4 row0, row1, row2, row3; };
+struct uint2
+{
+    uint x, y;
+};
+struct uint3
+{
+    uint x, y, z;
+};
+struct uint4
+{
+    uint x, y, z, w;
+};
+struct float2
+{
+    float x, y;
+};
+struct float3
+{
+    float x, y, z;
+};
+struct float4
+{
+    float x, y, z, w;
+};
+struct float3x4
+{
+    float4 row0, row1, row2;
+};
+struct float4x4
+{
+    float4 row0, row1, row2, row3;
+};
 
 // Use standard library span
-template<typename T>
+template <typename T>
 using Span = std::span<T>;
 
 // Explicit template for ByteSpan
@@ -59,26 +92,145 @@ GPU_DEFINE_HANDLE(GpuAccelerationStructure)
 #endif
 
 // Enums
-enum RESULT { RESULT_SUCCESS, RESULT_FAILURE };
-enum MEMORY { MEMORY_DEFAULT, MEMORY_GPU, MEMORY_READBACK };
-enum CULL { CULL_CCW, CULL_CW, CULL_ALL, CULL_NONE };
-enum DEPTH_FLAGS { DEPTH_UNDEFINED = 0x0, DEPTH_READ = 0x1, DEPTH_WRITE = 0x2 };
-enum OP { OP_NEVER, OP_LESS, OP_EQUAL, OP_LESS_EQUAL, OP_GREATER, OP_NOT_EQUAL, OP_GREATER_EQUAL, OP_ALWAYS, OP_KEEP, OP_ZERO }; 
-enum BLEND { BLEND_ADD, BLEND_SUBTRACT, BLEND_REV_SUBTRACT, BLEND_MIN, BLEND_MAX };
-enum FACTOR { FACTOR_ZERO, FACTOR_ONE, FACTOR_SRC_COLOR, FACTOR_DST_COLOR, FACTOR_SRC_ALPHA /*, ...*/ };
-enum TOPOLOGY { TOPOLOGY_TRIANGLE_LIST, TOPOLOGY_TRIANGLE_STRIP, TOPOLOGY_TRIANGLE_FAN };
-enum TEXTURE { TEXTURE_1D, TEXTURE_2D, TEXTURE_3D, TEXTURE_CUBE, TEXTURE_2D_ARRAY, TEXTURE_CUBE_ARRAY };
-enum FORMAT { FORMAT_NONE, FORMAT_RGBA8_UNORM, FORMAT_BGRA8_SRGB, FORMAT_D32_FLOAT, FORMAT_RG11B10_FLOAT, FORMAT_RGB10_A2_UNORM, FORMAT_RGB32_FLOAT, FORMAT_RG32_FLOAT, FORMAT_RGBA32_FLOAT, FORMAT_RGBA16_FLOAT /*, ...*/ };
-enum USAGE_FLAGS { USAGE_SAMPLED = 1 << 0, USAGE_STORAGE = 1 << 1, USAGE_COLOR_ATTACHMENT = 1 << 2, USAGE_DEPTH_STENCIL_ATTACHMENT = 1 << 3, USAGE_TRANSFER_DST = 1 << 4, USAGE_TRANSFER_SRC = 1 << 5 /*, ...*/ };
-enum STAGE { STAGE_TRANSFER, STAGE_COMPUTE, STAGE_RASTER_COLOR_OUT, STAGE_PIXEL_SHADER, STAGE_VERTEX_SHADER, STAGE_ACCELERATION_STRUCTURE_BUILD /*, ...*/ };
-enum HAZARD_FLAGS { HAZARD_NONE = 0x0, HAZARD_DRAW_ARGUMENTS = 0x1, HAZARD_DESCRIPTORS = 0x2, HAZARD_DEPTH_STENCIL = 0x4, HAZARD_ACCELERATION_STRUCTURE = 0x8 /*, ...*/ };
-enum SIGNAL { SIGNAL_ATOMIC_SET, SIGNAL_ATOMIC_MAX, SIGNAL_ATOMIC_OR /*, ...*/ };
+enum RESULT
+{
+    RESULT_SUCCESS,
+    RESULT_FAILURE
+};
+enum MEMORY
+{
+    MEMORY_DEFAULT,
+    MEMORY_GPU,
+    MEMORY_READBACK
+};
+enum CULL
+{
+    CULL_CCW,
+    CULL_CW,
+    CULL_ALL,
+    CULL_NONE
+};
+enum DEPTH_FLAGS
+{
+    DEPTH_UNDEFINED = 0x0,
+    DEPTH_READ = 0x1,
+    DEPTH_WRITE = 0x2
+};
+enum OP
+{
+    OP_NEVER,
+    OP_LESS,
+    OP_EQUAL,
+    OP_LESS_EQUAL,
+    OP_GREATER,
+    OP_NOT_EQUAL,
+    OP_GREATER_EQUAL,
+    OP_ALWAYS,
+    OP_KEEP,
+    OP_ZERO
+};
+enum BLEND
+{
+    BLEND_ADD,
+    BLEND_SUBTRACT,
+    BLEND_REV_SUBTRACT,
+    BLEND_MIN,
+    BLEND_MAX
+};
+enum FACTOR
+{
+    FACTOR_ZERO,
+    FACTOR_ONE,
+    FACTOR_SRC_COLOR,
+    FACTOR_DST_COLOR,
+    FACTOR_SRC_ALPHA /*, ...*/
+};
+enum TOPOLOGY
+{
+    TOPOLOGY_TRIANGLE_LIST,
+    TOPOLOGY_TRIANGLE_STRIP,
+    TOPOLOGY_TRIANGLE_FAN
+};
+enum TEXTURE
+{
+    TEXTURE_1D,
+    TEXTURE_2D,
+    TEXTURE_3D,
+    TEXTURE_CUBE,
+    TEXTURE_2D_ARRAY,
+    TEXTURE_CUBE_ARRAY
+};
+enum FORMAT
+{
+    FORMAT_NONE,
+    FORMAT_RGBA8_UNORM,
+    FORMAT_BGRA8_SRGB,
+    FORMAT_D32_FLOAT,
+    FORMAT_RG11B10_FLOAT,
+    FORMAT_RGB10_A2_UNORM,
+    FORMAT_RGB32_FLOAT,
+    FORMAT_RG32_FLOAT,
+    FORMAT_RGBA32_FLOAT,
+    FORMAT_RGBA16_FLOAT /*, ...*/
+};
+enum USAGE_FLAGS
+{
+    USAGE_SAMPLED = 1 << 0,
+    USAGE_STORAGE = 1 << 1,
+    USAGE_COLOR_ATTACHMENT = 1 << 2,
+    USAGE_DEPTH_STENCIL_ATTACHMENT = 1 << 3,
+    USAGE_TRANSFER_DST = 1 << 4,
+    USAGE_TRANSFER_SRC = 1 << 5 /*, ...*/
+};
+enum STAGE
+{
+    STAGE_TRANSFER,
+    STAGE_COMPUTE,
+    STAGE_RASTER_COLOR_OUT,
+    STAGE_PIXEL_SHADER,
+    STAGE_VERTEX_SHADER,
+    STAGE_ACCELERATION_STRUCTURE_BUILD /*, ...*/
+};
+enum HAZARD_FLAGS
+{
+    HAZARD_NONE = 0x0,
+    HAZARD_DRAW_ARGUMENTS = 0x1,
+    HAZARD_DESCRIPTORS = 0x2,
+    HAZARD_DEPTH_STENCIL = 0x4,
+    HAZARD_ACCELERATION_STRUCTURE = 0x8 /*, ...*/
+};
+enum SIGNAL
+{
+    SIGNAL_ATOMIC_SET,
+    SIGNAL_ATOMIC_MAX,
+    SIGNAL_ATOMIC_OR /*, ...*/
+};
 #ifdef GPU_RAY_TRACING_EXTENSION
-enum INDEX_TYPE { INDEX_TYPE_UINT16, INDEX_TYPE_UINT32 };
-enum GEOMETRY_TYPE { GEOMETRY_TYPE_TRIANGLES, GEOMETRY_TYPE_AABBS };
-enum MODE { MODE_BUILD, MODE_UPDATE };
-enum TYPE { TYPE_BOTTOM_LEVEL, TYPE_TOP_LEVEL };
-enum LOAD_OP { LOAD_OP_CLEAR, LOAD_OP_LOAD };
+enum INDEX_TYPE
+{
+    INDEX_TYPE_UINT16,
+    INDEX_TYPE_UINT32
+};
+enum GEOMETRY_TYPE
+{
+    GEOMETRY_TYPE_TRIANGLES,
+    GEOMETRY_TYPE_AABBS
+};
+enum MODE
+{
+    MODE_BUILD,
+    MODE_UPDATE
+};
+enum TYPE
+{
+    TYPE_BOTTOM_LEVEL,
+    TYPE_TOP_LEVEL
+};
+enum LOAD_OP
+{
+    LOAD_OP_CLEAR,
+    LOAD_OP_LOAD
+};
 #endif // GPU_RAY_TRACING_EXTENSION
 
 // View descriptor constants
@@ -86,7 +238,7 @@ constexpr uint8_t ALL_MIPS = 0xFF;
 constexpr uint16_t ALL_LAYERS = 0xFFFF;
 
 // Structs
-struct Stencil 
+struct Stencil
 {
     OP test = OP_ALWAYS;
     OP failOp = OP_KEEP;
@@ -95,7 +247,7 @@ struct Stencil
     uint8_t reference = 0;
 };
 
-struct GpuDepthStencilDesc 
+struct GpuDepthStencilDesc
 {
     DEPTH_FLAGS depthMode = DEPTH_UNDEFINED;
     OP depthTest = OP_ALWAYS;
@@ -119,7 +271,8 @@ struct GpuBlendDesc
     uint8_t colorWriteMask = 0xf;
 };
 
-struct ColorTarget {
+struct ColorTarget
+{
     FORMAT format = FORMAT_NONE;
     uint8_t writeMask = 0xf;
 };
@@ -138,17 +291,17 @@ struct GpuRasterDesc
 };
 
 struct GpuTextureDesc
-{ 
+{
     TEXTURE type = TEXTURE_2D;
     uint3 dimensions;
     uint32_t mipCount = 1;
     uint32_t layerCount = 1;
     uint32_t sampleCount = 1;
-    FORMAT format = FORMAT_NONE; 
+    FORMAT format = FORMAT_NONE;
     USAGE_FLAGS usage = USAGE_SAMPLED;
 };
 
-struct GpuViewDesc 
+struct GpuViewDesc
 {
     FORMAT format = FORMAT_NONE;
     uint8_t baseMip = 0;
@@ -157,7 +310,7 @@ struct GpuViewDesc
     uint16_t layerCount = ALL_LAYERS;
 };
 
-struct GpuRenderPassDesc 
+struct GpuRenderPassDesc
 {
     Span<GpuTexture> colorTargets = {};
     GpuTexture depthStencilTarget = nullptr;
@@ -169,7 +322,7 @@ struct GpuIndirectDrawArgs
     uint32_t indexCount;
     uint32_t instanceCount;
     uint32_t firstIndex;
-    int32_t  vertexOffset;
+    int32_t vertexOffset;
     uint32_t firstInstance;
 };
 
@@ -181,8 +334,15 @@ struct GpuDeviceDesc
     bool discrete;
 };
 
-struct GpuTextureSizeAlign { size_t size; size_t align; };
-struct GpuTextureDescriptor { uint64_t data[4]; };
+struct GpuTextureSizeAlign
+{
+    size_t size;
+    size_t align;
+};
+struct GpuTextureDescriptor
+{
+    uint64_t data[4];
+};
 
 #ifdef GPU_RAY_TRACING_EXTENSION
 struct GpuAccelerationStructureSizes
@@ -211,12 +371,12 @@ struct GpuAccelerationStructureAabbsDesc
 
 struct GpuAccelerationStructureInstanceDesc
 {
-    float3x4 transform = {};            
-    uint32_t instanceID : 24;           
-    uint32_t instanceMask : 8;          
-    uint32_t hitGroupIndex : 24; 
-    uint32_t flags : 8;                 
-    void* blasAddress;               
+    float3x4 transform = {};
+    uint32_t instanceID : 24;
+    uint32_t instanceMask : 8;
+    uint32_t hitGroupIndex : 24;
+    uint32_t flags : 8;
+    void* blasAddress;
 };
 
 struct GpuAccelerationStructureBlasDesc
@@ -272,8 +432,8 @@ void gpuDestroyDevice(GpuDevice device);
 // Memory
 void* gpuMalloc(GpuDevice device, size_t bytes, MEMORY memory = MEMORY_DEFAULT);
 void* gpuMalloc(GpuDevice device, size_t bytes, size_t align, MEMORY memory = MEMORY_DEFAULT);
-void gpuFree(GpuDevice device, void *ptr);
-void* gpuHostToDevicePointer(GpuDevice device, void *ptr);
+void gpuFree(GpuDevice device, void* ptr);
+void* gpuHostToDevicePointer(GpuDevice device, void* ptr);
 
 // Textures
 GpuTextureSizeAlign gpuTextureSizeAlign(GpuDevice device, GpuTextureDesc desc);
@@ -311,15 +471,15 @@ void gpuCopyToTexture(GpuCommandBuffer cb, void* srcGpu, GpuTexture texture);
 void gpuCopyFromTexture(GpuCommandBuffer cb, void* destGpu, GpuTexture texture);
 void gpuBlitTexture(GpuCommandBuffer cb, GpuTexture destTexture, GpuTexture srcTexture);
 
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void *ptrGpu);
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu);
 
 void gpuBarrier(GpuCommandBuffer cb, STAGE before, STAGE after, HAZARD_FLAGS hazards = HAZARD_NONE);
-void gpuSignalAfter(GpuCommandBuffer cb, STAGE before, void *ptrGpu, uint64_t value, SIGNAL signal);
-void gpuWaitBefore(GpuCommandBuffer cb, STAGE after, void *ptrGpu, uint64_t value, OP op, HAZARD_FLAGS hazards = HAZARD_NONE, uint64_t mask = ~0);
+void gpuSignalAfter(GpuCommandBuffer cb, STAGE before, void* ptrGpu, uint64_t value, SIGNAL signal);
+void gpuWaitBefore(GpuCommandBuffer cb, STAGE after, void* ptrGpu, uint64_t value, OP op, HAZARD_FLAGS hazards = HAZARD_NONE, uint64_t mask = ~0);
 
 void gpuSetPipeline(GpuCommandBuffer cb, GpuPipeline pipeline);
 void gpuSetDepthStencilState(GpuCommandBuffer cb, GpuDepthStencilState state);
-void gpuSetBlendState(GpuCommandBuffer cb, GpuBlendState state); 
+void gpuSetBlendState(GpuCommandBuffer cb, GpuBlendState state);
 
 void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions);
 void gpuDispatchIndirect(GpuCommandBuffer cb, void* dataGpu, void* gridDimensionsGpu);
@@ -332,7 +492,7 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer cb, void* vertexDataGpu, v
 void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer cb, void* dataVxGpu, uint32_t vxStride, void* dataPxGpu, uint32_t pxStride, void* indicesGpu, void* argsGpu, void* drawCountGpu);
 
 void gpuDrawMeshlets(GpuCommandBuffer cb, void* meshletDataGpu, void* pixelDataGpu, uint3 dim);
-void gpuDrawMeshletsIndirect(GpuCommandBuffer cb, void* meshletDataGpu, void* pixelDataGpu, void *dimGpu);
+void gpuDrawMeshletsIndirect(GpuCommandBuffer cb, void* meshletDataGpu, void* pixelDataGpu, void* dimGpu);
 
 #ifdef GPU_SURFACE_EXTENSION
 Span<FORMAT> gpuSurfaceFormats(GpuDevice device, GpuSurface surface);

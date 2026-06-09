@@ -24,9 +24,9 @@ static std::string getModeText(bool reference, bool spatial, bool temporal, bool
         return "Reference [R: RIS]";
 
     std::string text = "RIS [R: Reference";
-    text += spatial  ? " | S: Spatial On"  : " | S: Spatial Off";
+    text += spatial ? " | S: Spatial On" : " | S: Spatial Off";
     text += temporal ? " | T: Temporal On" : " | T: Temporal Off";
-    text += taa      ? " | X: TAA On"      : " | X: TAA Off";
+    text += taa ? " | X: TAA On" : " | X: TAA Off";
     text += "]";
     return text;
 }
@@ -44,7 +44,7 @@ int main()
     LinearAllocator allocator(device);
 
     int width, height, channels;
-    stbi_uc *inputImage = stbi_load("assets/Default.png", &width, &height, &channels, 4);
+    stbi_uc* inputImage = stbi_load("assets/Default.png", &width, &height, &channels, 4);
 
     auto upload = allocator.allocate<uint8_t>(width * height * 4);
     memcpy(upload.cpu, inputImage, width * height * 4);
@@ -54,78 +54,85 @@ int main()
 
     GpuTextureDesc textureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1},
+        .dimensions = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
         .format = FORMAT_RGBA8_UNORM,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)
+    };
 
     GpuTextureSizeAlign textureSizeAlign = gpuTextureSizeAlign(device, textureDesc);
-    void *texturePtr = gpuMalloc(device, textureSizeAlign.size, MEMORY_GPU);
+    void* texturePtr = gpuMalloc(device, textureSizeAlign.size, MEMORY_GPU);
     auto texture = gpuCreateTexture(device, textureDesc, texturePtr);
 
     // output texture
     GpuTextureDesc outputTextureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1},
+        .dimensions = { static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1 },
         .format = FORMAT_RGBA32_FLOAT,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_COLOR_ATTACHMENT | USAGE_SAMPLED)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_COLOR_ATTACHMENT | USAGE_SAMPLED)
+    };
 
     GpuTextureSizeAlign outputTextureSizeAlign = gpuTextureSizeAlign(device, outputTextureDesc);
-    void *outputTexturePtr = gpuMalloc(device, outputTextureSizeAlign.size, MEMORY_GPU);
+    void* outputTexturePtr = gpuMalloc(device, outputTextureSizeAlign.size, MEMORY_GPU);
     auto outputTexture = gpuCreateTexture(device, outputTextureDesc, outputTexturePtr);
 
     // albedo texture
     GpuTextureDesc albedoTextureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1},
+        .dimensions = { static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1 },
         .format = FORMAT_RGBA16_FLOAT,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED)
+    };
 
     GpuTextureSizeAlign albedoTextureSizeAlign = gpuTextureSizeAlign(device, albedoTextureDesc);
-    void *albedoTexturePtr = gpuMalloc(device, albedoTextureSizeAlign.size, MEMORY_GPU);
+    void* albedoTexturePtr = gpuMalloc(device, albedoTextureSizeAlign.size, MEMORY_GPU);
     auto albedoTexture = gpuCreateTexture(device, albedoTextureDesc, albedoTexturePtr);
 
     // normals
-     GpuTextureDesc normalsTextureDesc{
+    GpuTextureDesc normalsTextureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1},
+        .dimensions = { static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1 },
         .format = FORMAT_RGBA16_FLOAT,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED)
+    };
 
     GpuTextureSizeAlign normalsTextureSizeAlign = gpuTextureSizeAlign(device, normalsTextureDesc);
-    void *normalsTexturePtr = gpuMalloc(device, normalsTextureSizeAlign.size, MEMORY_GPU);
+    void* normalsTexturePtr = gpuMalloc(device, normalsTextureSizeAlign.size, MEMORY_GPU);
     auto normalsTexture = gpuCreateTexture(device, normalsTextureDesc, normalsTexturePtr);
 
     // motion vectors
     GpuTextureDesc motionVectorsTextureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1},
+        .dimensions = { static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1 },
         .format = FORMAT_RGBA16_FLOAT,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED)
+    };
 
     GpuTextureSizeAlign motionVectorsTextureSizeAlign = gpuTextureSizeAlign(device, motionVectorsTextureDesc);
-    void *motionVectorsTexturePtr = gpuMalloc(device, motionVectorsTextureSizeAlign.size, MEMORY_GPU);
+    void* motionVectorsTexturePtr = gpuMalloc(device, motionVectorsTextureSizeAlign.size, MEMORY_GPU);
     auto motionVectorsTexture = gpuCreateTexture(device, motionVectorsTextureDesc, motionVectorsTexturePtr);
 
     // TAA history texture
     GpuTextureDesc historyTextureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1},
+        .dimensions = { static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1 },
         .format = FORMAT_RGBA16_FLOAT,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)
+    };
 
     GpuTextureSizeAlign historyTextureSizeAlign = gpuTextureSizeAlign(device, historyTextureDesc);
-    void *historyTexturePtr = gpuMalloc(device, historyTextureSizeAlign.size, MEMORY_GPU);
+    void* historyTexturePtr = gpuMalloc(device, historyTextureSizeAlign.size, MEMORY_GPU);
     auto historyTexture = gpuCreateTexture(device, historyTextureDesc, historyTexturePtr);
 
     // TAA output texture
     GpuTextureDesc taaOutputTextureDesc{
         .type = TEXTURE_2D,
-        .dimensions = {static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1},
+        .dimensions = { static_cast<uint32_t>(swapchainDesc.dimensions.x), static_cast<uint32_t>(swapchainDesc.dimensions.y), 1 },
         .format = FORMAT_RGBA16_FLOAT,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_TRANSFER_SRC)};
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_TRANSFER_SRC)
+    };
 
     GpuTextureSizeAlign taaOutputTextureSizeAlign = gpuTextureSizeAlign(device, taaOutputTextureDesc);
-    void *taaOutputTexturePtr = gpuMalloc(device, taaOutputTextureSizeAlign.size, MEMORY_GPU);
+    void* taaOutputTexturePtr = gpuMalloc(device, taaOutputTextureSizeAlign.size, MEMORY_GPU);
     auto taaOutputTexture = gpuCreateTexture(device, taaOutputTextureDesc, taaOutputTexturePtr);
 
     enum HeapIndices
@@ -142,15 +149,15 @@ int main()
     };
 
     auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);
-    textureHeap.cpu[INDEX_CUBE] = gpuTextureViewDescriptor(texture, GpuViewDesc{.format = FORMAT_RGBA8_UNORM});
-    textureHeap.cpu[INDEX_CURRENT_FRAME] = gpuRWTextureViewDescriptor(outputTexture, GpuViewDesc{.format = FORMAT_RGBA32_FLOAT});
-    textureHeap.cpu[INDEX_ALBEDO] = gpuRWTextureViewDescriptor(albedoTexture, GpuViewDesc{.format = FORMAT_RGBA16_FLOAT});
-    textureHeap.cpu[INDEX_NORMALS] = gpuRWTextureViewDescriptor(normalsTexture, GpuViewDesc{.format = FORMAT_RGBA16_FLOAT});
-    textureHeap.cpu[INDEX_MOTION_VECTORS] = gpuRWTextureViewDescriptor(motionVectorsTexture, GpuViewDesc{.format = FORMAT_RGBA16_FLOAT});
-    textureHeap.cpu[INDEX_TAA_OUTPUT] = gpuRWTextureViewDescriptor(taaOutputTexture, GpuViewDesc{.format = FORMAT_RGBA16_FLOAT});
-    textureHeap.cpu[INDEX_HISTORY] = gpuTextureViewDescriptor(historyTexture, GpuViewDesc{.format = FORMAT_RGBA16_FLOAT});
-    textureHeap.cpu[INDEX_OUTPUT_SAMPLED] = gpuTextureViewDescriptor(outputTexture, GpuViewDesc{.format = FORMAT_RGBA32_FLOAT});
-    textureHeap.cpu[INDEX_MV_SAMPLED] = gpuTextureViewDescriptor(motionVectorsTexture, GpuViewDesc{.format = FORMAT_RGBA16_FLOAT});
+    textureHeap.cpu[INDEX_CUBE] = gpuTextureViewDescriptor(texture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
+    textureHeap.cpu[INDEX_CURRENT_FRAME] = gpuRWTextureViewDescriptor(outputTexture, GpuViewDesc{ .format = FORMAT_RGBA32_FLOAT });
+    textureHeap.cpu[INDEX_ALBEDO] = gpuRWTextureViewDescriptor(albedoTexture, GpuViewDesc{ .format = FORMAT_RGBA16_FLOAT });
+    textureHeap.cpu[INDEX_NORMALS] = gpuRWTextureViewDescriptor(normalsTexture, GpuViewDesc{ .format = FORMAT_RGBA16_FLOAT });
+    textureHeap.cpu[INDEX_MOTION_VECTORS] = gpuRWTextureViewDescriptor(motionVectorsTexture, GpuViewDesc{ .format = FORMAT_RGBA16_FLOAT });
+    textureHeap.cpu[INDEX_TAA_OUTPUT] = gpuRWTextureViewDescriptor(taaOutputTexture, GpuViewDesc{ .format = FORMAT_RGBA16_FLOAT });
+    textureHeap.cpu[INDEX_HISTORY] = gpuTextureViewDescriptor(historyTexture, GpuViewDesc{ .format = FORMAT_RGBA16_FLOAT });
+    textureHeap.cpu[INDEX_OUTPUT_SAMPLED] = gpuTextureViewDescriptor(outputTexture, GpuViewDesc{ .format = FORMAT_RGBA32_FLOAT });
+    textureHeap.cpu[INDEX_MV_SAMPLED] = gpuTextureViewDescriptor(motionVectorsTexture, GpuViewDesc{ .format = FORMAT_RGBA16_FLOAT });
 
     ColorTarget colorTarget = {};
     colorTarget.format = swapchainDesc.format;
@@ -186,7 +193,7 @@ int main()
     uint32_t numLights = 100;
     auto lightData = allocator.allocate<LightData>(numLights);
 
-    glm::vec3 cameraPos(0, 0, -5);   
+    glm::vec3 cameraPos(0, 0, -5);
     glm::vec3 prevCameraPos = cameraPos;
 
     {
@@ -196,15 +203,15 @@ int main()
         std::uniform_real_distribution<float> dis(-offset, offset);
 
         // put one light at the camera so we can always see something
-        lightData.cpu[0].position = {cameraPos.x, cameraPos.y, cameraPos.z, 1};
-        lightData.cpu[0].color = {1, 1, 1, 1};
+        lightData.cpu[0].position = { cameraPos.x, cameraPos.y, cameraPos.z, 1 };
+        lightData.cpu[0].color = { 1, 1, 1, 1 };
         lightData.cpu[0].intensity = 10.0f;
 
         // Randomly position lights in the scene
         for (int i = 1; i < numLights; ++i)
         {
-            lightData.cpu[i].position = {dis(gen), dis(gen), dis(gen), 1};
-            lightData.cpu[i].color = {1, 1, 1, 1};
+            lightData.cpu[i].position = { dis(gen), dis(gen), dis(gen), 1 };
+            lightData.cpu[i].color = { 1, 1, 1, 1 };
             lightData.cpu[i].intensity = 10.0f;
         }
     }
@@ -212,8 +219,9 @@ int main()
     auto camDataAlloc = allocator.allocate<CameraData>(FRAMES_IN_FLIGHT);
     auto haltonSeq = haltonSequence();
 
-    auto setCamera = [&](size_t frameIndex, float jitterX, float jitterY) {
-        camDataAlloc.cpu[frameIndex].position = {cameraPos.x, cameraPos.y, cameraPos.z, 1};
+    auto setCamera = [&](size_t frameIndex, float jitterX, float jitterY)
+    {
+        camDataAlloc.cpu[frameIndex].position = { cameraPos.x, cameraPos.y, cameraPos.z, 1 };
         auto view = glm::lookAt(cameraPos, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
         auto projection = glm::perspective(glm::radians(60.0f), swapchainDesc.dimensions.x / static_cast<float>(swapchainDesc.dimensions.y), 0.1f, 100.0f);
 
@@ -279,25 +287,29 @@ int main()
         .vertexFormat = FORMAT_RGB32_FLOAT,
         .indexDataGpu = indexBuffer.gpu,
         .indexType = INDEX_TYPE_UINT32,
-        .transformDataGpu = nullptr};
+        .transformDataGpu = nullptr
+    };
 
     GpuAccelerationStructureBlasDesc blasDesc = {
         .type = GEOMETRY_TYPE_TRIANGLES,
-        .triangles = Span<GpuAccelerationStructureTrianglesDesc>(&trianglesDesc, 1)};
+        .triangles = Span<GpuAccelerationStructureTrianglesDesc>(&trianglesDesc, 1)
+    };
 
     GpuAccelerationStructureBuildRange blasBuildRange = {
         .primitiveCount = static_cast<uint32_t>(indices.size() / 3),
         .primitiveOffset = 0,
         .firstVertex = 0,
-        .transformOffset = 0};
+        .transformOffset = 0
+    };
 
     GpuAccelerationStructureDesc blasASDesc = {
         .type = TYPE_BOTTOM_LEVEL,
         .blasDesc = blasDesc,
-        .buildRanges = Span<GpuAccelerationStructureBuildRange>(&blasBuildRange, 1)};
+        .buildRanges = Span<GpuAccelerationStructureBuildRange>(&blasBuildRange, 1)
+    };
 
     auto blasSize = gpuAccelerationStructureSizes(device, blasASDesc);
-    void *blasPtr = gpuMalloc(device, blasSize.size, MEMORY_GPU);
+    void* blasPtr = gpuMalloc(device, blasSize.size, MEMORY_GPU);
     auto blas = gpuCreateAccelerationStructure(device, blasASDesc, blasPtr, blasSize.size);
 
     auto instances = allocator.allocate<GpuAccelerationStructureInstanceDesc>(cubeCount);
@@ -317,9 +329,10 @@ int main()
             glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(dis(gen), dis(gen), dis(gen))) * glm::toMat4(rotation) * glm::scale(glm::mat4(1.0f), glm::vec3(scale));
 
             instances.cpu[i].transform = float3x4{
-                {model[0][0], model[1][0], model[2][0], model[3][0]},
-                {model[0][1], model[1][1], model[2][1], model[3][1]},
-                {model[0][2], model[1][2], model[2][2], model[3][2]}};
+                { model[0][0], model[1][0], model[2][0], model[3][0] },
+                { model[0][1], model[1][1], model[2][1], model[3][1] },
+                { model[0][2], model[1][2], model[2][2], model[3][2] }
+            };
             instances.cpu[i].instanceID = static_cast<uint32_t>(i);
             instances.cpu[i].instanceMask = 0xFF;
             instances.cpu[i].hitGroupIndex = 0;
@@ -332,21 +345,23 @@ int main()
         .primitiveCount = static_cast<uint32_t>(cubeCount),
         .primitiveOffset = 0,
         .firstVertex = 0,
-        .transformOffset = 0};
+        .transformOffset = 0
+    };
 
     GpuAccelerationStructureDesc tlasDesc = {
         .type = TYPE_TOP_LEVEL,
         .tlasDesc = {
             .arrayOfPointers = false,
-            .instancesGpu = instances.gpu},
-        .buildRanges = Span<GpuAccelerationStructureBuildRange>(&tlasBuildRange, 1)};
+            .instancesGpu = instances.gpu },
+        .buildRanges = Span<GpuAccelerationStructureBuildRange>(&tlasBuildRange, 1)
+    };
 
     auto tlasSize = gpuAccelerationStructureSizes(device, tlasDesc);
-    void *tlasPtr = gpuMalloc(device, tlasSize.size, MEMORY_GPU);
+    void* tlasPtr = gpuMalloc(device, tlasSize.size, MEMORY_GPU);
     auto tlas = gpuCreateAccelerationStructure(device, tlasDesc, tlasPtr, tlasSize.size);
 
     size_t scratchSize = std::max(blasSize.buildScratchSize, tlasSize.buildScratchSize);
-    void *scratchPtr = gpuMalloc(device, scratchSize, MEMORY_GPU);
+    void* scratchPtr = gpuMalloc(device, scratchSize, MEMORY_GPU);
 
     // ReSTIR buffers
     auto pixelSample = gpuMalloc(device, sizeof(Sample) * swapchainDesc.dimensions.x * swapchainDesc.dimensions.y, MEMORY_GPU);
@@ -362,7 +377,7 @@ int main()
     raytracingData.numLights = numLights;
     raytracingData.albedo = INDEX_ALBEDO;
     raytracingData.normals = INDEX_NORMALS;
-    raytracingData.motionVectors = INDEX_MOTION_VECTORS; 
+    raytracingData.motionVectors = INDEX_MOTION_VECTORS;
     raytracingData.dstTexture = INDEX_CURRENT_FRAME;
     raytracingData.frame = 0;
     raytracingData.M = 8;
@@ -437,12 +452,12 @@ int main()
         }
 
         // Arrow keys move the camera while held.
-        velocity.x = nga::isKeyDown(window, nga::Key::Left)  ? -velocityScale
-                   : nga::isKeyDown(window, nga::Key::Right) ?  velocityScale
-                   : 0.0f;
-        velocity.y = nga::isKeyDown(window, nga::Key::Up)    ?  velocityScale
-                   : nga::isKeyDown(window, nga::Key::Down)  ? -velocityScale
-                   : 0.0f;
+        velocity.x = nga::isKeyDown(window, nga::Key::Left)    ? -velocityScale
+                     : nga::isKeyDown(window, nga::Key::Right) ? velocityScale
+                                                               : 0.0f;
+        velocity.y = nga::isKeyDown(window, nga::Key::Up)     ? velocityScale
+                     : nga::isKeyDown(window, nga::Key::Down) ? -velocityScale
+                                                              : 0.0f;
 
         auto offset = (nextFrame - 1) % FRAMES_IN_FLIGHT;
 
@@ -455,7 +470,7 @@ int main()
             jitterX = 0.0f;
             jitterY = 0.0f;
         }
-        taaData.cpu->jitter = {jitterX, jitterY};
+        taaData.cpu->jitter = { jitterX, jitterY };
 
         setCamera(offset, jitterX, jitterY);
         raytracingData.camData = camDataAlloc.gpu + offset;
@@ -487,26 +502,25 @@ int main()
 
         auto image = gpuSwapchainImage(swapchain);
 
-
         if (reference)
         {
             gpuSetPipeline(commandBuffer, referencePipeline);
             gpuSetActiveTextureHeapPtr(commandBuffer, textureHeap.gpu);
-            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, {(uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1});
+            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, { (uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1 });
         }
         else // ReSTIR
         {
             gpuSetPipeline(commandBuffer, risPipeline);
             gpuSetActiveTextureHeapPtr(commandBuffer, textureHeap.gpu);
-            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, {(uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1});
+            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, { (uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1 });
             gpuBarrier(commandBuffer, STAGE_COMPUTE, STAGE_COMPUTE);
 
             gpuSetPipeline(commandBuffer, reusePipeline);
-            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, {(uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1});
+            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, { (uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1 });
             gpuBarrier(commandBuffer, STAGE_COMPUTE, STAGE_COMPUTE);
 
             gpuSetPipeline(commandBuffer, shadePipeline);
-            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, {(uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1});
+            gpuDispatch(commandBuffer, rtDataRingBufffer.gpu + offset, { (uint32_t)swapchainDesc.dimensions.x / 8, (uint32_t)swapchainDesc.dimensions.y / 8, 1 });
 
             if (taaOn)
             {
@@ -514,7 +528,7 @@ int main()
 
                 // TAA pass
                 gpuSetPipeline(commandBuffer, taaPipeline);
-                gpuDispatch(commandBuffer, taaData.gpu, {swapchainDesc.dimensions.x / 16, swapchainDesc.dimensions.y / 16, 1});
+                gpuDispatch(commandBuffer, taaData.gpu, { swapchainDesc.dimensions.x / 16, swapchainDesc.dimensions.y / 16, 1 });
             }
         }
         gpuBarrier(commandBuffer, STAGE_COMPUTE, STAGE_TRANSFER);
@@ -546,7 +560,7 @@ int main()
         auto modeText = getModeText(reference, raytracingData.spatial, raytracingData.temporal, taaOn);
         auto displayText = modeText + " | FPS: " + fpsString + (raytracingData.accumulate ? " | Accumulated Frames: " + std::to_string(raytracingData.accumulatedFrames) : "");
         textRenderer->renderText(commandBuffer, image,
-            displayText.c_str(), 10.0f, 10.0f, 1.0f, float3(1, 1, 1));
+                                 displayText.c_str(), 10.0f, 10.0f, 1.0f, float3(1, 1, 1));
 
         gpuSubmit(queue, Span<GpuCommandBuffer>(&commandBuffer, 1), semaphore, nextFrame);
         gpuPresent(swapchain, semaphore, nextFrame++);
@@ -582,7 +596,7 @@ int main()
 
     delete textRenderer;
     stbi_image_free(inputImage);
-    
+
     allocator.free();
 
     gpuDestroyTexture(texture);
