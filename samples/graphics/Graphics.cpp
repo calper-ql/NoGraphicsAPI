@@ -1,0 +1,346 @@
+#include "stb_image.h"
+#include "stb_image_write.h"
+
+#include <cstring>
+
+#include "window.h"
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include "Graphics.h"
+#include "Utilities.h"
+#include "TAA.h"
+
+int main()
+{
+    gpuCreateInstance();
+    auto device = gpuCreateDevice(0);
+
+    const uint FRAMES_IN_FLIGHT = 2;
+
+    auto window = nga::createWindow("Test Window", 1920, 1080);
+    auto surface = nga::createSurface(window);
+
+    LinearAllocator allocator(device);
+
+    int width, height, channels;
+    stbi_uc* inputImage = stbi_load("assets/Default.png", &width, &height, &channels, 4);
+
+    auto upload = allocator.allocate<uint8_t>(width * height * 4);
+    memcpy(upload.cpu, inputImage, width * height * 4);
+
+    // Cube texture
+    GpuTextureDesc textureDesc{
+        .type = TEXTURE_2D,
+        .dimensions = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
+        .format = FORMAT_RGBA8_UNORM,
+        .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)
+    };
+
+    auto swapchain = gpuCreateSwapchain(device, surface, FRAMES_IN_FLIGHT);
+    auto swapchainDesc = gpuSwapchainDesc(swapchain);
+
+    GpuTextureSizeAlign textureSizeAlign = gpuTextureSizeAlign(device, textureDesc);
+    void* texturePtr = gpuMalloc(device, textureSizeAlign.size, MEMORY_GPU);
+    auto texture = gpuCreateTexture(device, textureDesc, texturePtr);
+
+    // Depth texture
+    GpuTextureDesc depthDesc = {
+        .type = TEXTURE_2D,
+        .dimensions = { swapchainDesc.dimensions.x, swapchainDesc.dimensions.y, 1 },
+        .format = FORMAT_D32_FLOAT,
+        .usage = static_cast<USAGE_FLAGS>(USAGE_DEPTH_STENCIL_ATTACHMENT | USAGE_SAMPLED)
+    };
+
+    GpuTextureSizeAlign depthSizeAlign = gpuTextureSizeAlign(device, depthDesc);
+    void* depthPtr = gpuMalloc(device, depthSizeAlign.size, MEMORY_GPU);
+    auto depthTexture = gpuCreateTexture(device, depthDesc, depthPtr);
+
+    // History texture
+    GpuTextureDesc historyTexture{
+        .type = TEXTURE_2D,
+        .dimensions = { swapchainDesc.dimensions.x, swapchainDesc.dimensions.y, 1 },
+        .format = FORMAT_RGBA8_UNORM,
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_SAMPLED | USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST)
+    };
+
+    GpuTextureSizeAlign historyTextureSizeAlign = gpuTextureSizeAlign(device, historyTexture);
+    void* historyTexturePtr = gpuMalloc(device, historyTextureSizeAlign.size, MEMORY_GPU);
+    auto historyTextureGpu = gpuCreateTexture(device, historyTexture, historyTexturePtr);
+
+    // Raster output texture (separate from swapchain to avoid feedback loop in TAA)
+    GpuTextureDesc rasterOutputDesc{
+        .type = TEXTURE_2D,
+        .dimensions = { swapchainDesc.dimensions.x, swapchainDesc.dimensions.y, 1 },
+        .format = FORMAT_RGBA8_UNORM,
+        .usage = static_cast<USAGE_FLAGS>(USAGE_COLOR_ATTACHMENT | USAGE_SAMPLED)
+    };
+
+    GpuTextureSizeAlign rasterOutputSizeAlign = gpuTextureSizeAlign(device, rasterOutputDesc);
+    void* rasterOutputPtr = gpuMalloc(device, rasterOutputSizeAlign.size, MEMORY_GPU);
+    auto rasterOutputGpu = gpuCreateTexture(device, rasterOutputDesc, rasterOutputPtr);
+
+    // TAA output texture
+    GpuTextureDesc taaOutput{
+        .type = TEXTURE_2D,
+        .dimensions = { swapchainDesc.dimensions.x, swapchainDesc.dimensions.y, 1 },
+        .format = FORMAT_RGBA8_UNORM,
+        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_TRANSFER_SRC)
+    };
+
+    GpuTextureSizeAlign taaOutputSizeAlign = gpuTextureSizeAlign(device, taaOutput);
+    void* taaOutputPtr = gpuMalloc(device, taaOutputSizeAlign.size, MEMORY_GPU);
+    auto taaOutputGpu = gpuCreateTexture(device, taaOutput, taaOutputPtr);
+
+    // Motion vectors
+    GpuTextureDesc motionVectorsTexture{
+        .type = TEXTURE_2D,
+        .dimensions = { swapchainDesc.dimensions.x, swapchainDesc.dimensions.y, 1 },
+        .format = FORMAT_RGBA32_FLOAT,
+        .usage = static_cast<USAGE_FLAGS>(USAGE_COLOR_ATTACHMENT | USAGE_SAMPLED)
+    };
+
+    GpuTextureSizeAlign motionVectorsTextureSizeAlign = gpuTextureSizeAlign(device, motionVectorsTexture);
+    void* motionVectorsTexturePtr = gpuMalloc(device, motionVectorsTextureSizeAlign.size, MEMORY_GPU);
+    auto motionVectorsTextureGpu = gpuCreateTexture(device, motionVectorsTexture, motionVectorsTexturePtr);
+
+    enum HeapIndices
+    {
+        INDEX_CUBE = 0,
+        INDEX_CURRENT_FRAME = 1,
+        INDEX_HISTORY = 2,
+        INDEX_DEPTH = 3,
+        INDEX_MOTION_VECTORS = 4,
+        INDEX_TAA_OUTPUT = 5,
+    };
+
+    // Texture Heap
+    auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);
+    textureHeap.cpu[HeapIndices::INDEX_CUBE] = gpuTextureViewDescriptor(texture, GpuViewDesc{ .format = textureDesc.format });
+    textureHeap.cpu[HeapIndices::INDEX_CURRENT_FRAME] = gpuTextureViewDescriptor(rasterOutputGpu, GpuViewDesc{ .format = rasterOutputDesc.format });
+    textureHeap.cpu[HeapIndices::INDEX_HISTORY] = gpuTextureViewDescriptor(historyTextureGpu, GpuViewDesc{ .format = historyTexture.format });
+    textureHeap.cpu[HeapIndices::INDEX_DEPTH] = gpuTextureViewDescriptor(depthTexture, GpuViewDesc{ .format = depthDesc.format });
+    textureHeap.cpu[HeapIndices::INDEX_MOTION_VECTORS] = gpuTextureViewDescriptor(motionVectorsTextureGpu, GpuViewDesc{ .format = motionVectorsTexture.format });
+    textureHeap.cpu[HeapIndices::INDEX_TAA_OUTPUT] = gpuRWTextureViewDescriptor(taaOutputGpu, GpuViewDesc{ .format = taaOutput.format });
+
+    ColorTarget colorTargets[2] = {};
+    colorTargets[0].format = rasterOutputDesc.format;
+    colorTargets[1].format = motionVectorsTexture.format;
+
+    GpuRasterDesc rasterDesc = {
+        .cull = CULL_CCW,
+        .depthFormat = depthDesc.format,
+        .colorTargets = Span<ColorTarget>(colorTargets, 2)
+    };
+
+    auto vertexIR = loadIR("shaders/graphics/Vertex.spv");
+    auto pixelIR = loadIR("shaders/graphics/Pixel.spv");
+    auto pipeline = gpuCreateGraphicsPipeline(
+        device,
+        ByteSpan(vertexIR),
+        ByteSpan(pixelIR),
+        rasterDesc);
+
+    GpuDepthStencilDesc depthDescState = {
+        .depthMode = static_cast<DEPTH_FLAGS>(DEPTH_READ | DEPTH_WRITE),
+        .depthTest = OP_LESS,
+    };
+    GpuDepthStencilState depthState = gpuCreateDepthStencilState(depthDescState);
+
+    auto taaIR = loadIR("shaders/common/TAA.spv");
+    auto taaPipeline = gpuCreateComputePipeline(
+        device,
+        ByteSpan(taaIR));
+
+    std::vector<float3> cubeVertices;
+    std::vector<float3> cubeNormals;
+    std::vector<float2> cubeUVs;
+    std::vector<uint32_t> cubeIndices;
+    getCube(cubeVertices, cubeNormals, cubeUVs, cubeIndices);
+
+    auto vertices = allocator.allocate<float3>(cubeVertices.size());
+    memcpy(vertices.cpu, cubeVertices.data(), sizeof(float3) * cubeVertices.size());
+
+    auto uvs = allocator.allocate<float2>(cubeUVs.size());
+    memcpy(uvs.cpu, cubeUVs.data(), sizeof(float2) * cubeUVs.size());
+
+    auto indices = allocator.allocate<uint32_t>(cubeIndices.size());
+    memcpy(indices.cpu, cubeIndices.data(), sizeof(uint32_t) * cubeIndices.size());
+
+    auto instances = allocator.allocate<Instance>(2);
+
+    auto vertexData = allocator.allocate<VertexData>(1);
+    auto pixelData = allocator.allocate<PixelData>(1);
+    vertexData.cpu->vertices = vertices.gpu;
+    vertexData.cpu->uvs = uvs.gpu;
+    vertexData.cpu->instances = instances.gpu;
+    pixelData.cpu->srcTexture = 0;
+
+    auto haltonSeq = haltonSequence();
+
+    auto projection = glm::perspective(glm::radians(45.0f), 1920.0f / 1080.0f, 0.1f, 100.0f);
+    auto view = glm::lookAt(glm::vec3{ 0.0f, 3.0f, 5.0f }, glm::vec3{ 0.0f, 0.0f, 0.0f }, glm::vec3{ 0.0f, -1.0f, 0.0f });
+
+    float xRotation = 0.0f;
+    float yRotation = 0.0f;
+    glm::vec3 translation = glm::vec3(1.5f, 0.0f, 0.0f);
+    auto instance0 = glm::rotate(glm::translate(glm::mat4(1.f), translation), xRotation, glm::vec3(1.0f, 0.0f, 0.0f));
+    auto instance1 = glm::rotate(glm::translate(glm::mat4(1.f), -translation), yRotation, glm::vec3(0.0f, 1.0f, 0.0f));
+    memcpy(&instances.cpu[0].model, &instance0, sizeof(float4x4));
+    memcpy(&instances.cpu[1].model, &instance1, sizeof(float4x4));
+    memcpy(&instances.cpu[0].prevModel, &instance0, sizeof(float4x4));
+    memcpy(&instances.cpu[1].prevModel, &instance1, sizeof(float4x4));
+
+    // TAA data
+    auto taaData = allocator.allocate<TAAData>(1);
+    taaData.cpu->width = swapchainDesc.dimensions.x;
+    taaData.cpu->height = swapchainDesc.dimensions.y;
+    taaData.cpu->frame = 0;
+    taaData.cpu->srcColor = HeapIndices::INDEX_CURRENT_FRAME;
+    taaData.cpu->srcHistory = HeapIndices::INDEX_HISTORY;
+    taaData.cpu->srcDepth = HeapIndices::INDEX_DEPTH;
+    taaData.cpu->srcMotionVectors = HeapIndices::INDEX_MOTION_VECTORS;
+    taaData.cpu->dstTexture = HeapIndices::INDEX_TAA_OUTPUT;
+
+    auto queue = gpuCreateQueue(device);
+    auto semaphore = gpuCreateSemaphore(device, 0);
+    uint64_t nextFrame = 1;
+
+    bool taaOn = true;
+
+    while (!nga::shouldClose(window))
+    {
+        nga::pollEvents(window);
+        if (nga::wasKeyPressed(window, nga::Key::T))
+        {
+            taaOn = !taaOn;
+        }
+
+        // Update camera with jitter
+        auto prevViewProjectionNj = projection * view;
+
+        // update view matrix here for moving camera
+
+        float jitterX = (haltonSeq[nextFrame % haltonSeq.size()].x - 0.5f) / swapchainDesc.dimensions.x;
+        float jitterY = (haltonSeq[nextFrame % haltonSeq.size()].y - 0.5f) / swapchainDesc.dimensions.y;
+
+        if (!taaOn)
+        {
+            jitterX = 0.0f;
+            jitterY = 0.0f;
+        }
+
+        auto projectionWithJitter = projection;
+        projectionWithJitter[2][0] += jitterX * 2.0f;
+        projectionWithJitter[2][1] += jitterY * 2.0f;
+        auto viewProjection = projectionWithJitter * view;
+        auto viewProjectionNj = projection * view;
+        memcpy(&vertexData.cpu->viewProjection, &viewProjection, sizeof(float4x4));
+        memcpy(&vertexData.cpu->viewProjectionNj, &viewProjectionNj, sizeof(float4x4));
+        memcpy(&vertexData.cpu->prevViewProjectionNj, &prevViewProjectionNj, sizeof(float4x4));
+
+        // Pass jitter to TAA shader for unjittering
+        taaData.cpu->jitter = { jitterX, jitterY };
+
+        auto commandBuffer = gpuStartCommandRecording(queue);
+
+        if (nextFrame == 1)
+        {
+            // First frame, copy texture data
+            gpuCopyToTexture(commandBuffer, upload.gpu, texture);
+            gpuBarrier(commandBuffer, STAGE_TRANSFER, STAGE_PIXEL_SHADER);
+        }
+
+        if (nextFrame > FRAMES_IN_FLIGHT)
+        {
+            gpuWaitSemaphore(semaphore, nextFrame - FRAMES_IN_FLIGHT);
+        }
+
+        auto image = gpuSwapchainImage(swapchain);
+
+        GpuTexture colorTargets[2] = { rasterOutputGpu, motionVectorsTextureGpu };
+        GpuRenderPassDesc renderPassDesc = {
+            .colorTargets = Span<GpuTexture>(colorTargets, 2),
+            .depthStencilTarget = depthTexture
+        };
+
+        // Raster pass
+        gpuSetPipeline(commandBuffer, pipeline);
+        gpuSetActiveTextureHeapPtr(commandBuffer, textureHeap.gpu);
+        gpuBeginRenderPass(commandBuffer, renderPassDesc);
+        gpuSetDepthStencilState(commandBuffer, depthState);
+        gpuDrawIndexedInstanced(commandBuffer, vertexData.gpu, pixelData.gpu, indices.gpu, 36, 2);
+        gpuEndRenderPass(commandBuffer);
+
+        // TAA pass
+        gpuBarrier(commandBuffer, STAGE_RASTER_COLOR_OUT, STAGE_COMPUTE, HAZARD_DESCRIPTORS);
+        gpuSetPipeline(commandBuffer, taaPipeline);
+        gpuSetActiveTextureHeapPtr(commandBuffer, textureHeap.gpu);
+        gpuDispatch(commandBuffer, taaData.gpu, { swapchainDesc.dimensions.x / 16, swapchainDesc.dimensions.y / 16, 1 });
+
+        // Blit taa output to swapchain and copy to history texture
+        gpuBarrier(commandBuffer, STAGE_COMPUTE, STAGE_TRANSFER);
+        gpuBlitTexture(commandBuffer, image, taaOutputGpu);
+        gpuBlitTexture(commandBuffer, historyTextureGpu, taaOutputGpu);
+
+        gpuSubmit(queue, Span<GpuCommandBuffer>(&commandBuffer, 1), semaphore, nextFrame);
+        gpuPresent(swapchain, semaphore, nextFrame++);
+
+        xRotation += 0.0001f;
+        yRotation += 0.0001f;
+        auto instance0 = glm::translate(glm::mat4(1.f), translation) * glm::rotate(glm::mat4(1.f), xRotation, glm::vec3(1.0f, 0.0f, 0.0f));
+        auto instance1 = glm::translate(glm::mat4(1.f), -translation) * glm::rotate(glm::mat4(1.f), yRotation, glm::vec3(0.0f, 1.0f, 0.0f));
+
+        // copy current model to previous model
+        memcpy(&instances.cpu[0].prevModel, &instances.cpu[0].model, sizeof(float4x4));
+        memcpy(&instances.cpu[1].prevModel, &instances.cpu[1].model, sizeof(float4x4));
+
+        // update model matrices
+        memcpy(&instances.cpu[0].model, &instance0, sizeof(float4x4));
+        memcpy(&instances.cpu[1].model, &instance1, sizeof(float4x4));
+
+        // Increment TAA frame counter
+        if (taaOn)
+        {
+            taaData.cpu->frame++;
+        }
+        else
+        {
+            taaData.cpu->frame = 0;
+        }
+    }
+
+    gpuWaitSemaphore(semaphore, nextFrame - 1);
+
+    allocator.free();
+
+    stbi_image_free(inputImage);
+    gpuDestroyTexture(texture);
+    gpuFree(device, texturePtr);
+    gpuDestroyTexture(depthTexture);
+    gpuFree(device, depthPtr);
+    gpuDestroyTexture(historyTextureGpu);
+    gpuFree(device, historyTexturePtr);
+    gpuDestroyTexture(rasterOutputGpu);
+    gpuFree(device, rasterOutputPtr);
+    gpuDestroyTexture(taaOutputGpu);
+    gpuFree(device, taaOutputPtr);
+    gpuDestroyTexture(motionVectorsTextureGpu);
+    gpuFree(device, motionVectorsTexturePtr);
+    gpuFreePipeline(pipeline);
+    gpuFreePipeline(taaPipeline);
+    gpuFreeDepthStencilState(depthState);
+    // Destroy the swapchain first: it drains all queues (including the present
+    // queue), so the timeline semaphore is no longer in use when destroyed.
+    gpuDestroySwapchain(swapchain);
+    nga::destroySurface(window, surface);
+    nga::destroyWindow(window);
+    gpuDestroySemaphore(semaphore);
+    gpuDestroyQueue(queue);
+
+    gpuDestroyDevice(device);
+    gpuDestroyInstance();
+
+    return 0;
+}
