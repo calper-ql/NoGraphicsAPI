@@ -1,7 +1,6 @@
 #include "Compute.h"
 
-[numthreads(16, 16, 1)]
-void main(uint3 threadId: SV_DispatchThreadID, ComputeData* data)
+[numthreads(16, 16, 1)] void main(uint3 threadId : SV_DispatchThreadID, ComputeData* data)
 {
     int2 imgSize = int2(data->imageSize.x, data->imageSize.y);
     int2 pixelCoord = int2(threadId.x, threadId.y);
@@ -26,6 +25,14 @@ void main(uint3 threadId: SV_DispatchThreadID, ComputeData* data)
             color += srcTexture.SampleLevel(sampler, uv, 0);
         }
     }
-    
-    dstTexture[pixelCoord] = color / pow(kernelRadius * 2 + 1, 2);
+
+    color = color / pow(kernelRadius * 2 + 1, 2);
+
+    // Follow the pointer attached on the CPU side and read the Tint buffer. The
+    // image is split into `tintCount` vertical bands; each band uses one entry.
+    uint band = min((uint)pixelCoord.x * data->tintCount / (uint)imgSize.x, data->tintCount - 1);
+    Tint tint = data->tints[band];
+    color.rgb = lerp(color.rgb, color.rgb * tint.color, tint.strength);
+
+    dstTexture[pixelCoord] = color;
 }

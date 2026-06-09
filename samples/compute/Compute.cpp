@@ -30,7 +30,7 @@ int main()
     auto pipeline = gpuCreateComputePipeline(device, ByteSpan(computeIR.data(), computeIR.size()));
 
     auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);
-    
+
     // Load input image
     int width, height, channels;
     stbi_uc* inputImage = stbi_load("assets/Default.png", &width, &height, &channels, 4);
@@ -59,7 +59,7 @@ int main()
     void* outputPtr = gpuMalloc(device, textureSizeAlign.size, MEMORY_GPU);
     auto outputTexture = gpuCreateTexture(device, outputTextureDes, outputPtr);
 
-    textureHeap.cpu[0] = gpuTextureViewDescriptor(texture, GpuViewDesc{.format = FORMAT_RGBA8_UNORM });
+    textureHeap.cpu[0] = gpuTextureViewDescriptor(texture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
     textureHeap.cpu[1] = gpuRWTextureViewDescriptor(outputTexture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
 
     auto commandBuffer = gpuStartCommandRecording(queue);
@@ -73,14 +73,24 @@ int main()
     data.cpu->srcTexture = 0;
     data.cpu->dstTexture = 1;
 
+    // Attach a regular buffer: allocate an array of Tint structs, fill it on the
+    // CPU, and hand its GPU pointer to the shader through the data struct. Nothing
+    // is bound — the shader just follows `data->tints` to read whatever we point
+    // it at, so the size and contents are entirely decided here at runtime.
+    const uint32_t tintCount = 4;
+    auto tints = allocator.allocate<Tint>(tintCount);
+    tints.cpu[0] = { { 1.0f, 0.5f, 0.5f }, 0.6f }; // red band
+    tints.cpu[1] = { { 0.5f, 1.0f, 0.5f }, 0.6f }; // green band
+    tints.cpu[2] = { { 0.5f, 0.5f, 1.0f }, 0.6f }; // blue band
+    tints.cpu[3] = { { 1.0f, 1.0f, 0.5f }, 0.6f }; // yellow band
+
+    data.cpu->tints = tints.gpu;
+    data.cpu->tintCount = tintCount;
+
     commandBuffer = gpuStartCommandRecording(queue);
     gpuSetPipeline(commandBuffer, pipeline);
     gpuSetActiveTextureHeapPtr(commandBuffer, textureHeap.gpu);
-    gpuDispatch(commandBuffer, data.gpu, { 
-            static_cast<uint32_t>(width / 16), 
-            static_cast<uint32_t>(height / 16), 
-            1
-    });
+    gpuDispatch(commandBuffer, data.gpu, { static_cast<uint32_t>(width / 16), static_cast<uint32_t>(height / 16), 1 });
 
     gpuSubmit(queue, Span<GpuCommandBuffer>(&commandBuffer, 1), semaphore, 2);
     gpuWaitSemaphore(semaphore, 2);
