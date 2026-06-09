@@ -1792,7 +1792,7 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
         {
             // Embedded at build time (PatchDescriptorsSpv.h) so the library works
             // without a .spv file on disk; copied because ByteSpan is non-const.
-            std::vector<uint8_t> patchDescriptorsSpv(std::begin(NgaPatchDescriptorsSpv), std::end(NgaPatchDescriptorsSpv));
+            std::vector<uint8_t> patchDescriptorsSpv(std::begin(NgapiPatchDescriptorsSpv), std::end(NgapiPatchDescriptorsSpv));
             vulkanDevice->patchDescriptorsPipeline = gpuCreateComputePipeline(device, patchDescriptorsSpv);
         }
 

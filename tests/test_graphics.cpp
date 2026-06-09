@@ -40,7 +40,7 @@ int main(int argc, char** argv)
     LinearAllocator allocator(device);
 
     int width, height, channels;
-    const std::string inputPath = std::string(NGA_TEST_ASSET_DIR) + "/Default.png";
+    const std::string inputPath = std::string(NGAPI_TEST_ASSET_DIR) + "/Default.png";
     stbi_uc* inputImage = stbi_load(inputPath.c_str(), &width, &height, &channels, 4);
     if (!inputImage)
     {
@@ -112,14 +112,14 @@ int main(int argc, char** argv)
         .colorTargets = Span<ColorTarget>(colorTargets, 2)
     };
 
-    auto vertexIR = loadIR(std::string(NGA_TEST_SHADER_DIR) + "/graphics/Vertex.spv");
-    auto pixelIR = loadIR(std::string(NGA_TEST_SHADER_DIR) + "/graphics/Pixel.spv");
+    auto vertexIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/graphics/Vertex.spv");
+    auto pixelIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/graphics/Pixel.spv");
     auto pipeline = gpuCreateGraphicsPipeline(device, ByteSpan(vertexIR), ByteSpan(pixelIR), rasterPipeDesc);
 
     GpuDepthStencilDesc depthDescState = { .depthMode = (DEPTH_FLAGS)(DEPTH_READ | DEPTH_WRITE), .depthTest = OP_LESS };
     auto depthState = gpuCreateDepthStencilState(depthDescState);
 
-    auto taaIR = loadIR(std::string(NGA_TEST_SHADER_DIR) + "/common/TAA.spv");
+    auto taaIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/common/TAA.spv");
     auto taaPipeline = gpuCreateComputePipeline(device, ByteSpan(taaIR));
 
     std::vector<float3> cubeVertices, cubeNormals;
