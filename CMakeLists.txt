@@ -126,7 +126,8 @@ include(ngapi/cmake/CompileShaders.cmake)
 set(COMMON_SHADER_DEPS
     "${NGAPI_INCLUDE_DIR}/NoGraphicsAPI.h"
     "${NGAPI_INCLUDE_DIR}/NoGraphicsAPI_Impl.h"
-    "${NGAPI_INCLUDE_DIR}/Config.h")
+    "${NGAPI_INCLUDE_DIR}/Config.h"
+    "${NGAPI_INCLUDE_DIR}/Sampler.h")
 
 set(NGAPI_SHADER_OUTPUTS "")
 compile_shader(SOURCE samples/compute/Compute.slang     STAGE compute  OUTPUT compute/Compute.spv
@@ -153,6 +154,11 @@ compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT ra
     EXTRA_DEPENDS ${RT_SHADER_DEPS})
 compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT raytracing/Shade.spv ENTRY Shade
     EXTRA_DEPENDS ${RT_SHADER_DEPS})
+
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchHW.spv ENTRY benchHardware
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchSW.spv ENTRY benchSoftware
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
 
 # The learning sample's tensor ops are nine compute entry points in one .slang;
 # compile them all into a single Tensor.spv (Device_impl builds a pipeline per
