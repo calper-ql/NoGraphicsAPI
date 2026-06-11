@@ -35,7 +35,7 @@
     // image is split into `tintCount` vertical bands; each band uses one entry.
     uint band = min((uint)pixelCoord.x * data->tintCount / (uint)imgSize.x, data->tintCount - 1);
     Tint tint = data->tints[band];
-    color.rgb = lerp(color.rgb, color.rgb * tint.color, tint.strength);
+    color.rgb = lerp(color.rgb, color.rgb * tint.color.rgb, tint.strength);
 
     dstTexture[pixelCoord] = color;
 }

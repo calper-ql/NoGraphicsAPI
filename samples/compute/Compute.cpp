@@ -75,10 +75,10 @@ int main()
     // Per-band tint data
     const uint32_t tintCount = 4;
     auto tints = allocator.allocate<Tint>(tintCount);
-    tints.cpu[0] = { { 1.0f, 0.5f, 0.5f }, 0.6f }; // red
-    tints.cpu[1] = { { 0.5f, 1.0f, 0.5f }, 0.6f }; // green
-    tints.cpu[2] = { { 0.5f, 0.5f, 1.0f }, 0.6f }; // blue
-    tints.cpu[3] = { { 1.0f, 1.0f, 0.5f }, 0.6f }; // yellow
+    tints.cpu[0] = { { 1.0f, 0.5f, 0.5f, 0.0f }, 0.6f }; // red
+    tints.cpu[1] = { { 0.5f, 1.0f, 0.5f, 0.0f }, 0.6f }; // green
+    tints.cpu[2] = { { 0.5f, 0.5f, 1.0f, 0.0f }, 0.6f }; // blue
+    tints.cpu[3] = { { 1.0f, 1.0f, 0.5f, 0.0f }, 0.6f }; // yellow
 
     auto data = allocator.allocate<ComputeData>(1);
     data.cpu->imageSize  = { (uint32_t)width, (uint32_t)height };

@@ -7,8 +7,8 @@
 // pointer to an array of these; the shader follows that pointer to read them.
 struct alignas(16) Tint
 {
-    float3 color;
-    float strength;
+    float4 color;    // xyz = RGB tint, w unused; float4 avoids MSL float3 padding mismatch
+    float  strength;
 };
 
 struct alignas(16) ComputeData

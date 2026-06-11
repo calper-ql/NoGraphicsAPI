@@ -103,6 +103,32 @@ add_custom_target(my_shaders ALL DEPENDS ${NGAPI_SHADER_OUTPUTS})
 `slangc` is picked up from `PATH` or the `VULKAN_SDK` environment variable;
 pass `-DSLANGC=/path/to/slangc` to override.
 
+## Shared CPU/GPU struct layout rules
+
+Structs passed to shaders via device-buffer pointers must have identical layout
+on the CPU (C++) and GPU (MSL/SPIR-V) sides. One common pitfall:
+
+**Never use `float3` in a device-buffer struct.** Metal MSL gives `float3`
+16-byte alignment inside structs, effectively padding it to 16 bytes, while
+NGAPI's C++ `float3` is 12 bytes. Any field that follows `float3` in the struct
+sits at a different offset on each side, silently corrupting data. Use `float4`
+with `w = 0.0` instead, and access `.rgb` / `.xyz` in the shader.
+
+Use `NGAPI_ASSERT_GPU_STRUCT` (defined in `NoGraphicsAPI_Impl.h`) to catch
+layout drift at compile time:
+
+```cpp
+struct alignas(16) MyData
+{
+    float4 color;   // NOT float3 — see layout rules above
+    float  value;
+};
+NGAPI_ASSERT_GPU_STRUCT(MyData, 32);
+```
+
+The assert fires immediately if the struct size deviates from what the GPU
+expects, making layout bugs a compile error rather than a silent corruption.
+
 ## Developing NGAPI itself
 
 `src/PatchDescriptorsSpv.h` is generated from `shaders/PatchDescriptors.slang`
