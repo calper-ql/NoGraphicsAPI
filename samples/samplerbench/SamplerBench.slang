@@ -1,11 +1,11 @@
 #include "SamplerBench.h"
 
-// Two entry points with the identical tap loop; the only difference is who
-// does the bilinear filtering — the hardware sampler (samplerHeap[0], the
-// implementation's LINEAR/WRAP default) or the software Sampler (same
-// settings via its defaults). Tap offsets are deliberately non-integer so the
-// bilinear weights are real work in both paths, and the accumulated result is
-// written out so nothing can be dead-code eliminated.
+// Identical tap loops; the only difference is who does the bilinear filtering
+// — the raw hardware sampler (the implementation's LINEAR/WRAP default at
+// internal heap slot 0, referenced directly as the ground-truth row), a
+// STATIC_SAMPLER, or the software Sampler. Tap offsets are deliberately
+// non-integer so the bilinear weights are real work in all paths, and the
+// accumulated result is written out so nothing can be dead-code eliminated.
 
 float2 tapUV(int2 pixelCoord, int kx, int ky, float2 invSize)
 {
@@ -98,7 +98,7 @@ STATIC_SAMPLER(staticNearestClamp, NEAREST, NEAREST, NEAREST, CLAMP, CLAMP)
         return;
 
     Texture2D<float4> srcTexture = textureHeap[data->srcTexture];
-    SamplerState sampler = samplerHeap[0];
+    SamplerState sampler = ngapiSamplerHeap[0]; // internal heap: raw reference row only
     float2 invSize = 1.0 / float2(imgSize);
 
     int r = data->kernelRadius;
