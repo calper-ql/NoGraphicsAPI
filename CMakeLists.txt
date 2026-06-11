@@ -159,6 +159,8 @@ compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTP
     EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
 compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchSW.spv ENTRY benchSoftware
     EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchStatic.spv ENTRY benchStatic
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
 
 add_custom_target(shaders ALL DEPENDS ${NGAPI_SHADER_OUTPUTS})
 

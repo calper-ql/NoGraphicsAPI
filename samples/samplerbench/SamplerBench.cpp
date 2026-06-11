@@ -109,8 +109,10 @@ int main()
 
     auto hwIR = loadIR("shaders/samplerbench/BenchHW.spv");
     auto swIR = loadIR("shaders/samplerbench/BenchSW.spv");
+    auto staticIR = loadIR("shaders/samplerbench/BenchStatic.spv");
     auto hwPipeline = gpuCreateComputePipeline(device, ByteSpan(hwIR.data(), hwIR.size()));
     auto swPipeline = gpuCreateComputePipeline(device, ByteSpan(swIR.data(), swIR.size()));
+    auto staticPipeline = gpuCreateComputePipeline(device, ByteSpan(staticIR.data(), staticIR.size()));
 
     const uint32_t width = 1024, height = 1024;
     const size_t textureBytes = static_cast<size_t>(width) * height * 4;
@@ -176,7 +178,7 @@ int main()
             maxDiff = std::max(maxDiff, std::abs(int(hwImage[i]) - int(swImage[i])));
         std::printf("hardware vs software output: maxDiff=%d/255 %s\n\n", maxDiff, maxDiff <= 8 ? "(ok)" : "(SUSPICIOUS)");
 
-        std::printf("%-28s %12s %12s %14s\n", "config", "hw ms", "sw ms", "sw/hw");
+        std::printf("%-28s %12s %15s %12s %14s %12s\n", "config", "hw ms", "static ms", "sw ms", "static/hw", "sw/hw");
         for (int radius : { 0, 4, 16 })
         {
             data.cpu->kernelRadius = radius;
@@ -186,14 +188,13 @@ int main()
             const int repeats = 3;
 
             double hwMs = timer.time(hwPipeline, textureHeap.gpu, data.gpu, grid, dispatches, repeats);
+            double staticMs = timer.time(staticPipeline, textureHeap.gpu, data.gpu, grid, dispatches, repeats);
             double swMs = timer.time(swPipeline, textureHeap.gpu, data.gpu, grid, dispatches, repeats);
 
-            const double gsamples = double(width) * height * taps / 1.0e9;
             char label[64];
             std::snprintf(label, sizeof(label), "r=%-2d (%4d taps/pixel)", radius, taps);
-            std::printf("%-28s %9.3f ms %9.3f ms %10.2fx   (hw %.1f, sw %.1f Gsamples/s)\n",
-                        label, hwMs, swMs, swMs / hwMs,
-                        gsamples / (hwMs / 1000.0), gsamples / (swMs / 1000.0));
+            std::printf("%-28s %9.3f ms %12.3f ms %9.3f ms %11.2fx %11.2fx\n",
+                        label, hwMs, staticMs, swMs, staticMs / hwMs, swMs / hwMs);
         }
     } // timer scope
 
@@ -202,6 +203,7 @@ int main()
     gpuDestroyTexture(dstTexture);
     gpuFreePipeline(hwPipeline);
     gpuFreePipeline(swPipeline);
+    gpuFreePipeline(staticPipeline);
     gpuFree(device, srcPtr);
     gpuFree(device, dstPtr);
     gpuDestroyQueue(queue);
