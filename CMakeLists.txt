@@ -155,12 +155,11 @@ compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT ra
 compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT raytracing/Shade.spv ENTRY Shade
     EXTRA_DEPENDS ${RT_SHADER_DEPS})
 
-foreach(BENCH_ENTRY benchHardware benchStatic benchInline benchStaticNearest benchManualNearest)
-    string(REPLACE "bench" "Bench" BENCH_OUT "${BENCH_ENTRY}")
-    compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute
-        OUTPUT samplerbench/${BENCH_OUT}.spv ENTRY ${BENCH_ENTRY}
-        EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
-endforeach()
+# All bench entry points in one module (one slangc invocation); the harness
+# picks entries at pipeline creation.
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/Bench.spv
+    ENTRY benchHardware benchStatic benchInline benchStaticNearest benchManualNearest
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
 
 # The learning sample's tensor ops are nine compute entry points in one .slang;
 # compile them all into a single Tensor.spv (Device_impl builds a pipeline per
