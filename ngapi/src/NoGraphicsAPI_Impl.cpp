@@ -428,6 +428,13 @@ struct VulkanDevice
     std::vector<Allocation> allocations;
     Allocation samplerDescriptors;
 
+    // Static samplers (STATIC_SAMPLER in Sampler.h): hardware samplers created
+    // on demand at pipeline creation, deduplicated by packed state. Slot 0 is
+    // the default sampler.
+    std::map<uint64_t, uint32_t> staticSamplerSlots; // packed state -> heap slot
+    std::vector<VkSampler> staticSamplers;
+    uint32_t nextSamplerSlot = 1;
+
     // Opaque handles
     std::map<GpuCommandBuffer, GpuPipeline> currentPipeline;
 
@@ -498,11 +505,13 @@ struct VulkanDevice
         physicalDeviceVulkan12Features.bufferDeviceAddress = VK_TRUE;
         physicalDeviceVulkan12Features.runtimeDescriptorArray = VK_TRUE;
         physicalDeviceVulkan12Features.shaderInt8 = VK_TRUE;
+        physicalDeviceVulkan12Features.samplerMirrorClampToEdge = VK_TRUE; // MIRROR_CLAMP address mode
 #ifndef _WIN32
         physicalDeviceVulkan12Features.storagePushConstant8 = VK_TRUE;
 #endif
 
         vulkanDevice->physicalDevice.features.shaderInt64 = VK_TRUE;
+        vulkanDevice->physicalDevice.features.samplerAnisotropy = VK_TRUE; // static samplers can request anisotropy
 
 #ifdef GPU_RAY_TRACING_EXTENSION
 #endif // GPU_RAY_TRACING_EXTENSION
@@ -601,6 +610,10 @@ struct VulkanDevice
 
         dispatchTable.destroyCommandPool(commandPool, nullptr);
         dispatchTable.destroySampler(defaultSampler, nullptr);
+        for (auto sampler : staticSamplers)
+        {
+            dispatchTable.destroySampler(sampler, nullptr);
+        }
         dispatchTable.destroyFence(acquireFence, nullptr);
         dispatchTable.destroyDescriptorSetLayout(textureSetLayout, nullptr);
         dispatchTable.destroyDescriptorSetLayout(rwTextureSetLayout, nullptr);
@@ -1317,13 +1330,226 @@ GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuTexture texture, GpuViewDesc 
     return descriptor;
 }
 
+// Lazily creates the internal sampler descriptor heap (set 2) with the
+// default sampler at slot 0; static samplers fill the slots above it.
+void ensureSamplerHeap(VulkanDevice* vulkanDevice)
+{
+    if (vulkanDevice->samplerDescriptors.buffer != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    auto cpu = gpuMallocHidden(vulkanDevice,
+                               vulkanDevice->samplerDescriptorSetLayoutSize,
+                               vulkanDevice->descriptorBufferProperties.descriptorBufferOffsetAlignment,
+                               MEMORY_DEFAULT,
+                               true // sampler
+    );
+
+    vulkanDevice->samplerDescriptors = vulkanDevice->findAllocation(cpu);
+
+    VkDescriptorGetInfoEXT samplerDescriptorGetInfo = {};
+    samplerDescriptorGetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
+    samplerDescriptorGetInfo.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    samplerDescriptorGetInfo.data.pSampler = &vulkanDevice->defaultSampler;
+    vulkanDevice->dispatchTable.getDescriptorEXT(&samplerDescriptorGetInfo, vulkanDevice->descriptorBufferProperties.samplerDescriptorSize, vulkanDevice->samplerDescriptors.ptr);
+}
+
+// Scans SPIR-V for sampler declarations (see Sampler.h): 64-bit specialization
+// constants whose default carries STATIC_SAMPLER_MAGIC, and 32-bit literals
+// carrying INLINE_SAMPLER_MAGIC. Types and decorations precede constants in a
+// valid module, so one pass is enough.
+struct StaticSamplerRequests
+{
+    std::vector<std::pair<uint32_t, uint64_t>> spec;         // SpecId -> packed 48-bit state
+    std::vector<std::pair<size_t, uint64_t>> inlineLiterals; // value word index -> canonical state
+};
+
+StaticSamplerRequests findStaticSamplerRequests(ByteSpan ir)
+{
+    StaticSamplerRequests requests;
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(ir.data());
+    const size_t wordCount = ir.size() / sizeof(uint32_t);
+    if (wordCount < 5 || words[0] != 0x07230203) // little-endian SPIR-V only
+    {
+        return requests;
+    }
+
+    std::map<uint32_t, uint32_t> specIds;       // result id -> SpecId
+    std::map<uint32_t, uint32_t> unsignedWidth; // type id -> integer width (unsigned types only)
+    for (size_t at = 5; at < wordCount;)
+    {
+        const uint32_t length = words[at] >> 16;
+        const uint32_t opcode = words[at] & 0xffff;
+        if (length == 0 || at + length > wordCount)
+        {
+            break;
+        }
+
+        constexpr uint32_t OpTypeInt = 21, OpConstant = 43, OpSpecConstant = 50, OpDecorate = 71, DecorationSpecId = 1;
+        if (opcode == OpTypeInt && length == 4 && words[at + 3] == 0)
+        {
+            unsignedWidth[words[at + 1]] = words[at + 2];
+        }
+        else if (opcode == OpDecorate && length == 4 && words[at + 2] == DecorationSpecId)
+        {
+            specIds[words[at + 1]] = words[at + 3];
+        }
+        else if (opcode == OpSpecConstant && length == 5 && unsignedWidth[words[at + 1]] == 64)
+        {
+            const uint64_t value = words[at + 3] | (static_cast<uint64_t>(words[at + 4]) << 32);
+            auto specId = specIds.find(words[at + 2]);
+            if (specId != specIds.end() && (value & STATIC_SAMPLER_MAGIC_MASK) == STATIC_SAMPLER_MAGIC)
+            {
+                requests.spec.push_back({ specId->second, value & ~STATIC_SAMPLER_MAGIC_MASK });
+            }
+        }
+        else if (opcode == OpConstant && length == 4 && unsignedWidth[words[at + 1]] == 32)
+        {
+            const uint32_t value = words[at + 3];
+            if ((value & INLINE_SAMPLER_MAGIC_MASK) == INLINE_SAMPLER_MAGIC)
+            {
+                // Canonicalize to the 48-bit layout: inline samplers carry no
+                // lod fields, so bias 0 (encoded 128) and an unbounded maxLod.
+                const uint64_t state = (value & 0x7fffff) | (128ull << 23) | (255ull << 39);
+                requests.inlineLiterals.push_back({ at + 3, state });
+            }
+        }
+        at += length;
+    }
+    return requests;
+}
+
+// Returns the sampler heap slot for a packed 48-bit sampler state, creating
+// and deduplicating the VkSampler on first use.
+uint32_t staticSamplerSlot(VulkanDevice* vulkanDevice, uint64_t packedState)
+{
+    auto existing = vulkanDevice->staticSamplerSlots.find(packedState);
+    if (existing != vulkanDevice->staticSamplerSlots.end())
+    {
+        return existing->second;
+    }
+
+    ensureSamplerHeap(vulkanDevice);
+
+    constexpr VkFilter filters[] = { VK_FILTER_NEAREST, VK_FILTER_LINEAR };
+    constexpr VkSamplerMipmapMode mipModes[] = { VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_MIPMAP_MODE_LINEAR };
+    constexpr VkSamplerAddressMode addressModes[] = { VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                      VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                                                      VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE };
+    constexpr VkBorderColor borderColors[] = { VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+                                               VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE };
+
+    const VkPhysicalDeviceLimits& limits = vulkanDevice->physicalDeviceProperties2.properties.limits;
+
+    VkSamplerCreateInfo samplerInfo = {};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.minFilter = filters[packedState & 1];
+    samplerInfo.magFilter = filters[(packedState >> 1) & 1];
+    samplerInfo.mipmapMode = mipModes[(packedState >> 2) & 1];
+    samplerInfo.addressModeU = addressModes[(packedState >> 3) & 7];
+    samplerInfo.addressModeV = addressModes[(packedState >> 6) & 7];
+    samplerInfo.addressModeW = addressModes[(packedState >> 9) & 7];
+    samplerInfo.borderColor = borderColors[(packedState >> 17) & 3];
+
+    const uint32_t maxAnisotropy = (packedState >> 12) & 31;
+    if (maxAnisotropy > 1)
+    {
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        samplerInfo.maxAnisotropy = std::min(static_cast<float>(maxAnisotropy), limits.maxSamplerAnisotropy);
+    }
+
+    const uint32_t compare = (packedState >> 19) & 15;
+    if (compare > 0)
+    {
+        samplerInfo.compareEnable = VK_TRUE;
+        samplerInfo.compareOp = static_cast<VkCompareOp>(compare - 1);
+    }
+
+    const float lodBias = static_cast<float>((packedState >> 23) & 255) / 16.0f - 8.0f;
+    samplerInfo.mipLodBias = std::clamp(lodBias, -limits.maxSamplerLodBias, limits.maxSamplerLodBias);
+    samplerInfo.minLod = static_cast<float>((packedState >> 31) & 255) / 16.0f;
+    const uint32_t maxLodBits = (packedState >> 39) & 255;
+    samplerInfo.maxLod = maxLodBits == 255 ? VK_LOD_CLAMP_NONE : static_cast<float>(maxLodBits) / 16.0f;
+
+    const uint32_t slot = vulkanDevice->nextSamplerSlot++;
+    assert(slot < vulkanDevice->descriptorCount);
+
+    VkSampler sampler;
+    vulkanDevice->dispatchTable.createSampler(&samplerInfo, nullptr, &sampler);
+    vulkanDevice->staticSamplers.push_back(sampler);
+
+    VkDescriptorGetInfoEXT getInfo = {};
+    getInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
+    getInfo.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    getInfo.data.pSampler = &sampler;
+    vulkanDevice->dispatchTable.getDescriptorEXT(&getInfo,
+                                                 vulkanDevice->descriptorBufferProperties.samplerDescriptorSize,
+                                                 static_cast<uint8_t*>(vulkanDevice->samplerDescriptors.ptr) +
+                                                     vulkanDevice->samplerDescriptorSetLayoutOffset +
+                                                     slot * vulkanDevice->descriptorBufferProperties.samplerDescriptorSize);
+
+    vulkanDevice->staticSamplerSlots[packedState] = slot;
+    return slot;
+}
+
+// Per-stage sampler resolution: STATIC_SAMPLER spec constants get a
+// VkSpecializationInfo mapping them to their heap slots; INLINE_SAMPLER
+// literals are patched in a copy of the IR. Must stay alive until the
+// pipeline is created.
+struct StaticSamplerStage
+{
+    std::vector<VkSpecializationMapEntry> entries;
+    std::vector<uint64_t> slots;
+    VkSpecializationInfo info = {};
+    std::vector<uint8_t> patchedIR;
+
+    // Returns the IR to create the shader module from and sets *specInfo for
+    // the stage (or nullptr).
+    ByteSpan prepare(VulkanDevice* vulkanDevice, ByteSpan ir, const VkSpecializationInfo** specInfo)
+    {
+        auto requests = findStaticSamplerRequests(ir);
+
+        for (auto& [specId, packedState] : requests.spec)
+        {
+            entries.push_back({ specId, static_cast<uint32_t>(slots.size() * sizeof(uint64_t)), sizeof(uint64_t) });
+            slots.push_back(staticSamplerSlot(vulkanDevice, packedState));
+        }
+        *specInfo = nullptr;
+        if (!entries.empty())
+        {
+            info.mapEntryCount = static_cast<uint32_t>(entries.size());
+            info.pMapEntries = entries.data();
+            info.dataSize = slots.size() * sizeof(uint64_t);
+            info.pData = slots.data();
+            *specInfo = &info;
+        }
+
+        if (requests.inlineLiterals.empty())
+        {
+            return ir;
+        }
+        patchedIR.assign(ir.data(), ir.data() + ir.size());
+        uint32_t* words = reinterpret_cast<uint32_t*>(patchedIR.data());
+        for (auto& [wordIndex, packedState] : requests.inlineLiterals)
+        {
+            words[wordIndex] = staticSamplerSlot(vulkanDevice, packedState);
+        }
+        return ByteSpan(patchedIR.data(), patchedIR.size());
+    }
+};
+
 GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan computeIR, const char* entry)
 {
     VulkanDevice* vulkanDevice = device->vulkanDevice;
     VkShaderModuleCreateInfo shaderModuleCreateInfo = {};
+    StaticSamplerStage samplerStage;
+    const VkSpecializationInfo* samplerSpecInfo = nullptr;
+    ByteSpan moduleIR = samplerStage.prepare(vulkanDevice, computeIR, &samplerSpecInfo);
+
     shaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    shaderModuleCreateInfo.codeSize = computeIR.size();
-    shaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(computeIR.data());
+    shaderModuleCreateInfo.codeSize = moduleIR.size();
+    shaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(moduleIR.data());
     VkShaderModule shaderModule;
     vulkanDevice->dispatchTable.createShaderModule(&shaderModuleCreateInfo, nullptr, &shaderModule);
 
@@ -1334,6 +1560,7 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan computeIR, const
     pipelineCreateInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     pipelineCreateInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineCreateInfo.stage.module = shaderModule;
+    pipelineCreateInfo.stage.pSpecializationInfo = samplerSpecInfo;
     pipelineCreateInfo.stage.pName = entry;
 
     VkPipeline pipeline;
@@ -1348,17 +1575,25 @@ VkPipeline gpuCreateGraphicsPipelineInternal(VulkanDevice* vulkanDevice, ByteSpa
     bool vertex = vertexIR.size() > 0;
     ByteSpan actualIR = vertex ? vertexIR : meshletIR;
 
+    StaticSamplerStage vertexSamplerStage;
+    const VkSpecializationInfo* vertexSamplerSpecInfo = nullptr;
+    ByteSpan vertexModuleIR = vertexSamplerStage.prepare(vulkanDevice, actualIR, &vertexSamplerSpecInfo);
+
+    StaticSamplerStage pixelSamplerStage;
+    const VkSpecializationInfo* pixelSamplerSpecInfo = nullptr;
+    ByteSpan pixelModuleIR = pixelSamplerStage.prepare(vulkanDevice, pixelIR, &pixelSamplerSpecInfo);
+
     VkShaderModuleCreateInfo vertexShaderModuleCreateInfo = {};
     vertexShaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    vertexShaderModuleCreateInfo.codeSize = actualIR.size();
-    vertexShaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(actualIR.data());
+    vertexShaderModuleCreateInfo.codeSize = vertexModuleIR.size();
+    vertexShaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(vertexModuleIR.data());
     VkShaderModule vertexShaderModule;
     vulkanDevice->dispatchTable.createShaderModule(&vertexShaderModuleCreateInfo, nullptr, &vertexShaderModule);
 
     VkShaderModuleCreateInfo pixelShaderModuleCreateInfo = {};
     pixelShaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    pixelShaderModuleCreateInfo.codeSize = pixelIR.size();
-    pixelShaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(pixelIR.data());
+    pixelShaderModuleCreateInfo.codeSize = pixelModuleIR.size();
+    pixelShaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(pixelModuleIR.data());
     VkShaderModule pixelShaderModule;
     vulkanDevice->dispatchTable.createShaderModule(&pixelShaderModuleCreateInfo, nullptr, &pixelShaderModule);
 
@@ -1367,11 +1602,13 @@ VkPipeline gpuCreateGraphicsPipelineInternal(VulkanDevice* vulkanDevice, ByteSpa
     shaderStages[0].stage = vertex ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_MESH_BIT_NV;
     shaderStages[0].module = vertexShaderModule;
     shaderStages[0].pName = "main";
+    shaderStages[0].pSpecializationInfo = vertexSamplerSpecInfo;
 
     shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     shaderStages[1].module = pixelShaderModule;
     shaderStages[1].pName = "main";
+    shaderStages[1].pSpecializationInfo = pixelSamplerSpecInfo;
 
     std::vector<VkFormat> colorFormats;
     std::vector<VkPipelineColorBlendAttachmentState> blendAttachments;
@@ -1770,24 +2007,9 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
     VulkanDevice* vulkanDevice = device->vulkanDevice;
     auto alloc = vulkanDevice->findAllocation(reinterpret_cast<VkDeviceAddress>(ptrGpu));
 
-    // TODO: support samplers, for now we just bind a default sampler
-    if (vulkanDevice->samplerDescriptors.buffer == VK_NULL_HANDLE)
-    {
-        auto cpu = gpuMallocHidden(vulkanDevice,
-                                   vulkanDevice->samplerDescriptorSetLayoutSize,
-                                   vulkanDevice->descriptorBufferProperties.descriptorBufferOffsetAlignment,
-                                   MEMORY_DEFAULT,
-                                   true // sampler
-        );
-
-        vulkanDevice->samplerDescriptors = vulkanDevice->findAllocation(cpu);
-
-        VkDescriptorGetInfoEXT samplerDescriptorGetInfo = {};
-        samplerDescriptorGetInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT;
-        samplerDescriptorGetInfo.type = VK_DESCRIPTOR_TYPE_SAMPLER;
-        samplerDescriptorGetInfo.data.pSampler = &vulkanDevice->defaultSampler;
-        vulkanDevice->dispatchTable.getDescriptorEXT(&samplerDescriptorGetInfo, vulkanDevice->descriptorBufferProperties.samplerDescriptorSize, vulkanDevice->samplerDescriptors.ptr);
-    }
+    // Default sampler at slot 0; static samplers land in the slots above
+    // (created at pipeline creation, see staticSamplerSlot).
+    ensureSamplerHeap(vulkanDevice);
 
     VkDeviceAddress address = reinterpret_cast<VkDeviceAddress>(ptrGpu);
     VkDeviceAddress rwAddress = address;
