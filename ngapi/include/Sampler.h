@@ -139,6 +139,14 @@ float4 ngapiSampleMip(Texture2D<float4> tex, Sampler s, float2 uv, int mip, uint
     return lerp(lerp(c00, c10, weight.x), lerp(c01, c11, weight.x), weight.y);
 }
 
+// Implementation detail: the hardware sampler heap (descriptor set 2) that
+// static sampler slots index into. The implementation owns its contents —
+// user code never references it; samplers reach shaders as Sampler data or
+// STATIC_SAMPLER declarations, mirroring the blog's API which has no sampler
+// heap at all.
+[[vk::binding(0, 2)]]
+SamplerState ngapiSamplerHeap[];
+
 // A hardware sampler reached through a heap slot the host picked at pipeline
 // creation. Same call shape as the software Sampler.
 struct HwSampler
@@ -146,7 +154,7 @@ struct HwSampler
     uint slot;
     float4 SampleLevel(Texture2D<float4> tex, float2 uv, float lod = 0.0)
     {
-        return tex.SampleLevel(samplerHeap[slot], uv, lod);
+        return tex.SampleLevel(ngapiSamplerHeap[slot], uv, lod);
     }
 };
 

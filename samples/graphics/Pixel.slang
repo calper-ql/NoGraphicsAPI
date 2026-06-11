@@ -1,5 +1,7 @@
 #include "Graphics.h"
 
+STATIC_SAMPLER(linearWrap, LINEAR, LINEAR, NEAREST, WRAP, WRAP)
+
 struct PixelIn
 {
     float4 position : SV_Position;
@@ -16,7 +18,7 @@ struct PixelOut
 PixelOut main(PixelIn inPixel, VertexData* _, PixelData* data)
 {
     PixelOut outPixel;
-    outPixel.color = textureHeap[data->srcTexture].SampleLevel(samplerHeap[0], inPixel.uv, 0);
+    outPixel.color = linearWrap().SampleLevel(textureHeap[data->srcTexture], inPixel.uv, 0);
     outPixel.motionVectors = float4(inPixel.motionVectors, 0.0, 0.0);
     return outPixel;
 }
