@@ -51,7 +51,7 @@ target_include_directories(stb PUBLIC external/stb)
 set(NGAPI_WINDOW_BACKEND "GLFW" CACHE STRING "Windowing backend: GLFW or SDL3")
 set_property(CACHE NGAPI_WINDOW_BACKEND PROPERTY STRINGS GLFW SDL3)
 
-if(NGAPI_BUILD_SAMPLES)
+if(NGAPI_BUILD_SAMPLES AND NOT NGAPI_METAL_BACKEND)
 if(NGAPI_WINDOW_BACKEND STREQUAL "GLFW")
     set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
     set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -72,12 +72,13 @@ elseif(NGAPI_WINDOW_BACKEND STREQUAL "SDL3")
 else()
     message(FATAL_ERROR "NGAPI_WINDOW_BACKEND must be GLFW or SDL3 (got '${NGAPI_WINDOW_BACKEND}')")
 endif()
-endif() # NGAPI_BUILD_SAMPLES
+endif() # NGAPI_BUILD_SAMPLES AND NOT NGAPI_METAL_BACKEND
 
 # ---------------------------------------------------------------------------
-# Windowing abstraction (one backend compiled in) -- only with the samples.
+# Windowing abstraction (one backend compiled in) -- only with the samples,
+# and only when using the Vulkan backend (Metal windowing is not in the spike).
 # ---------------------------------------------------------------------------
-if(NGAPI_BUILD_SAMPLES)
+if(NGAPI_BUILD_SAMPLES AND NOT NGAPI_METAL_BACKEND)
 if(NGAPI_WINDOW_BACKEND STREQUAL "GLFW")
     add_library(ngapi-platform STATIC platform/window_glfw.cpp)
     target_link_libraries(ngapi-platform PRIVATE glfw Vulkan::Vulkan)
@@ -99,12 +100,17 @@ target_link_libraries(ngapi-samples-common
     PRIVATE stb)
 
 # ---------------------------------------------------------------------------
-# Shader compilation (slang -> SPIR-V) for the samples and tests
+# Shader compilation (slang -> SPIR-V) for the samples and tests.
+# Skipped for the Metal backend spike — Metal shaders are not compiled here yet.
 # ---------------------------------------------------------------------------
 if(NOT DEFINED VULKAN_SDK AND DEFINED ENV{VULKAN_SDK})
     set(VULKAN_SDK $ENV{VULKAN_SDK})
 endif()
-find_program(SLANGC slangc HINTS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+# Use PATHS (not HINTS) so system PATH is searched before the Vulkan SDK bin.
+# Metal shaders require slangc 2026+ for the device-pointer MSL calling convention;
+# a PATH-installed slangc is usually newer than the one bundled in the SDK.
+unset(SLANGC CACHE)
+find_program(SLANGC slangc PATHS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
 if(NOT SLANGC)
     message(FATAL_ERROR "slangc not found; set VULKAN_SDK or put slangc on PATH. "
         "(Only the samples and tests need it — consuming the ngapi/ library does not.)")
@@ -119,6 +125,26 @@ else()
     set(NGAPI_RUNTIME_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 endif()
 
+if(NGAPI_METAL_BACKEND)
+set(NGAPI_SHADER_OUTPUT_DIR  "${NGAPI_RUNTIME_DIR}/shaders")
+set(NGAPI_SHADER_INCLUDE_DIR "${NGAPI_INCLUDE_DIR}")
+include(ngapi/cmake/CompileMetalShaders.cmake)
+
+set(METAL_SHADER_DEPS
+    "${NGAPI_INCLUDE_DIR}/NoGraphicsAPI.h"
+    "${NGAPI_INCLUDE_DIR}/Config.h"
+    "${NGAPI_INCLUDE_DIR}/Sampler.h")
+
+set(NGAPI_METAL_SHADER_OUTPUTS "")
+compile_metal_shader(SOURCE samples/learning/Tensor.slang STAGE compute
+    OUTPUT learning/Tensor.metal
+    ENTRY _add _sub _mul _div _dot _mT _matmul _pow _tanh
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
+
+add_custom_target(metal_shaders ALL DEPENDS ${NGAPI_METAL_SHADER_OUTPUTS})
+endif() # NGAPI_METAL_BACKEND
+
+if(NOT NGAPI_METAL_BACKEND)
 set(NGAPI_SHADER_OUTPUT_DIR  "${NGAPI_RUNTIME_DIR}/shaders")
 set(NGAPI_SHADER_INCLUDE_DIR "${NGAPI_INCLUDE_DIR}")
 include(ngapi/cmake/CompileShaders.cmake)
@@ -180,10 +206,12 @@ add_custom_target(ngapi-embed-patch-descriptors
     COMMAND ${CMAKE_COMMAND} -DSLANGC=${SLANGC}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/ngapi/cmake/EmbedPatchDescriptors.cmake"
     COMMENT "Re-embedding PatchDescriptors.slang into ngapi/src/PatchDescriptorsSpv.h")
+endif() # NOT NGAPI_METAL_BACKEND
 
 # Copy assets next to the executables (samples load these from the run dir; the
 # tests read assets straight from the source tree, so this is samples-only).
 if(NGAPI_BUILD_SAMPLES)
+if(NOT NGAPI_METAL_BACKEND)
 add_custom_target(copy_assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${NGAPI_RUNTIME_DIR}/assets"
@@ -202,11 +230,13 @@ endfunction()
 add_windowed_sample(compute    samples/compute/Compute.cpp)
 add_windowed_sample(graphics   samples/graphics/Graphics.cpp)
 add_windowed_sample(raytracing samples/raytracing/Raytracing.cpp)
+endif() # NOT NGAPI_METAL_BACKEND
 
 # Headless sample: no window, no shaders/assets.
 add_executable(multiplegpus samples/multiplegpus/MultipleGPUs.cpp)
 target_link_libraries(multiplegpus PRIVATE ngapi::ngapi)
 
+if(NOT NGAPI_METAL_BACKEND)
 # Scratch sampler regression benchmark (run from build/bin).
 add_executable(samplerbench samples/samplerbench/SamplerBench.cpp)
 target_link_libraries(samplerbench PRIVATE ngapi::ngapi ngapi-samples-common)
@@ -222,6 +252,14 @@ add_dependencies(multithreading shaders)
 add_executable(learning samples/learning/Learning.cpp samples/learning/Tensor.cpp)
 target_link_libraries(learning PRIVATE ngapi::ngapi ngapi-samples-common glm::glm)
 add_dependencies(learning shaders)
+endif() # NOT NGAPI_METAL_BACKEND
+
+if(NGAPI_METAL_BACKEND)
+add_executable(learning samples/learning/Learning.cpp samples/learning/Tensor.cpp)
+target_link_libraries(learning PRIVATE ngapi::ngapi ngapi-samples-common glm::glm)
+add_dependencies(learning metal_shaders)
+endif() # NGAPI_METAL_BACKEND
+
 endif() # NGA_BUILD_SAMPLES
 
 # ---------------------------------------------------------------------------

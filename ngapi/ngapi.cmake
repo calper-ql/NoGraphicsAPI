@@ -35,53 +35,76 @@ endif()
 set(NGAPI_DIR "${CMAKE_CURRENT_LIST_DIR}")
 set(NGAPI_INCLUDE_DIR "${NGAPI_DIR}/include")
 
-# ngapi's link interface names Vulkan::Vulkan, which consumers resolve from
-# their own directories — but find_package() imported targets are scoped to
-# the directory that created them, so promote ours to global. (Skipped when
-# the consuming project already found Vulkan itself.)
-if(NOT TARGET Vulkan::Vulkan)
-    find_package(Vulkan REQUIRED)
-    set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_GLOBAL TRUE)
-endif()
-
 # ---------------------------------------------------------------------------
-# vk-bootstrap (the only library dependency), resolved in order:
-#   1. a vk-bootstrap target the consuming project already created
-#   2. NGAPI_VK_BOOTSTRAP_DIR — an explicit local checkout
-#   3. the external/vk-bootstrap submodule (full-repo layout)
-#   4. FetchContent, pinned to the same tag as the submodule
+# Backend selection
 # ---------------------------------------------------------------------------
-set(NGAPI_VK_BOOTSTRAP_TAG "v1.4.353")
-set(NGAPI_VK_BOOTSTRAP_DIR "" CACHE PATH
-    "Path to a local vk-bootstrap checkout (skips the submodule/download lookup)")
+option(NGAPI_METAL_BACKEND "Use the Metal backend (macOS/iOS) instead of Vulkan" OFF)
 
-if(NOT TARGET vk-bootstrap::vk-bootstrap)
-    if(NGAPI_VK_BOOTSTRAP_DIR)
-        add_subdirectory("${NGAPI_VK_BOOTSTRAP_DIR}"
-                         "${CMAKE_CURRENT_BINARY_DIR}/ngapi-vk-bootstrap" EXCLUDE_FROM_ALL)
-    elseif(EXISTS "${NGAPI_DIR}/../external/vk-bootstrap/CMakeLists.txt")
-        add_subdirectory("${NGAPI_DIR}/../external/vk-bootstrap"
-                         "${CMAKE_CURRENT_BINARY_DIR}/ngapi-vk-bootstrap" EXCLUDE_FROM_ALL)
-    else()
-        include(FetchContent)
-        FetchContent_Declare(vk-bootstrap
-            GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git
-            GIT_TAG        ${NGAPI_VK_BOOTSTRAP_TAG}
-            GIT_SHALLOW    TRUE)
-        FetchContent_MakeAvailable(vk-bootstrap)
+if(NGAPI_METAL_BACKEND)
+    # ---------------------------------------------------------------------------
+    # Metal backend
+    # ---------------------------------------------------------------------------
+    add_library(ngapi STATIC "${NGAPI_DIR}/src/NoGraphicsAPI_Metal.mm")
+    add_library(ngapi::ngapi ALIAS ngapi)
+
+    target_compile_features(ngapi PUBLIC cxx_std_20)
+    target_include_directories(ngapi PUBLIC "${NGAPI_INCLUDE_DIR}")
+    target_include_directories(ngapi PRIVATE "${NGAPI_DIR}/src")
+    target_compile_definitions(ngapi PUBLIC GPU_METAL_BACKEND)
+    target_link_libraries(ngapi PRIVATE
+        "-framework Metal"
+        "-framework Foundation"
+        "-framework QuartzCore")
+else()
+    # ---------------------------------------------------------------------------
+    # Vulkan backend (default)
+    # ---------------------------------------------------------------------------
+
+    # ngapi's link interface names Vulkan::Vulkan, which consumers resolve from
+    # their own directories — but find_package() imported targets are scoped to
+    # the directory that created them, so promote ours to global. (Skipped when
+    # the consuming project already found Vulkan itself.)
+    if(NOT TARGET Vulkan::Vulkan)
+        find_package(Vulkan REQUIRED)
+        set_target_properties(Vulkan::Vulkan PROPERTIES IMPORTED_GLOBAL TRUE)
     endif()
+
+    # -------------------------------------------------------------------------
+    # vk-bootstrap (the only library dependency), resolved in order:
+    #   1. a vk-bootstrap target the consuming project already created
+    #   2. NGAPI_VK_BOOTSTRAP_DIR — an explicit local checkout
+    #   3. the external/vk-bootstrap submodule (full-repo layout)
+    #   4. FetchContent, pinned to the same tag as the submodule
+    # -------------------------------------------------------------------------
+    set(NGAPI_VK_BOOTSTRAP_TAG "v1.4.353")
+    set(NGAPI_VK_BOOTSTRAP_DIR "" CACHE PATH
+        "Path to a local vk-bootstrap checkout (skips the submodule/download lookup)")
+
+    if(NOT TARGET vk-bootstrap::vk-bootstrap)
+        if(NGAPI_VK_BOOTSTRAP_DIR)
+            add_subdirectory("${NGAPI_VK_BOOTSTRAP_DIR}"
+                             "${CMAKE_CURRENT_BINARY_DIR}/ngapi-vk-bootstrap" EXCLUDE_FROM_ALL)
+        elseif(EXISTS "${NGAPI_DIR}/../external/vk-bootstrap/CMakeLists.txt")
+            add_subdirectory("${NGAPI_DIR}/../external/vk-bootstrap"
+                             "${CMAKE_CURRENT_BINARY_DIR}/ngapi-vk-bootstrap" EXCLUDE_FROM_ALL)
+        else()
+            include(FetchContent)
+            FetchContent_Declare(vk-bootstrap
+                GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git
+                GIT_TAG        ${NGAPI_VK_BOOTSTRAP_TAG}
+                GIT_SHALLOW    TRUE)
+            FetchContent_MakeAvailable(vk-bootstrap)
+        endif()
+    endif()
+
+    add_library(ngapi STATIC "${NGAPI_DIR}/src/NoGraphicsAPI_Impl.cpp")
+    add_library(ngapi::ngapi ALIAS ngapi)
+
+    target_compile_features(ngapi PUBLIC cxx_std_20)
+    target_include_directories(ngapi PUBLIC "${NGAPI_INCLUDE_DIR}")
+    target_include_directories(ngapi PRIVATE "${NGAPI_DIR}/src" "${NGAPI_DIR}/shaders")
+    target_link_libraries(ngapi PRIVATE Vulkan::Vulkan vk-bootstrap::vk-bootstrap)
 endif()
-
-# ---------------------------------------------------------------------------
-# The library
-# ---------------------------------------------------------------------------
-add_library(ngapi STATIC "${NGAPI_DIR}/src/NoGraphicsAPI_Impl.cpp")
-add_library(ngapi::ngapi ALIAS ngapi)
-
-target_compile_features(ngapi PUBLIC cxx_std_20)
-target_include_directories(ngapi PUBLIC "${NGAPI_INCLUDE_DIR}")
-target_include_directories(ngapi PRIVATE "${NGAPI_DIR}/src" "${NGAPI_DIR}/shaders")
-target_link_libraries(ngapi PRIVATE Vulkan::Vulkan vk-bootstrap::vk-bootstrap)
 
 # Lets consumers `include(CompileShaders)` for slang -> SPIR-V compilation.
 list(APPEND CMAKE_MODULE_PATH "${NGAPI_DIR}/cmake")
