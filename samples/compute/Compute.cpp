@@ -4,9 +4,7 @@
 #include <cstdio>
 #include <cstring>
 
-#ifndef GPU_METAL_BACKEND
 #include "window.h"
-#endif
 
 #include "Compute.h"
 #include "Utilities.h"
@@ -100,24 +98,11 @@ int main()
         gpuWaitSemaphore(semaphore, 2);
     }
 
-#ifdef GPU_METAL_BACKEND
-    // Headless path: read back the result and write to a PNG.
-    auto readback = allocator.allocate<uint8_t>((size_t)width * height * 4);
-    {
-        auto cb = gpuStartCommandRecording(queue);
-        gpuCopyFromTexture(cb, readback.gpu, outputTexture);
-        gpuSubmit(queue, Span<GpuCommandBuffer>(&cb, 1), semaphore, 3);
-        gpuWaitSemaphore(semaphore, 3);
-    }
-    const char* outFile = "output_compute.png";
-    stbi_write_png(outFile, width, height, 4, readback.cpu, width * 4);
-    printf("compute: wrote %s  (%dx%d)\n", outFile, width, height);
-#else
-    // Windowed path: blit the result to the swapchain in a render loop.
+    // Windowed path: blit the compute result to the swapchain each frame.
     const uint FRAMES_IN_FLIGHT = 2;
-    auto window       = ngapi::createWindow("Compute", 1920, 1080);
-    auto surface      = ngapi::createSurface(window);
-    auto swapchain    = gpuCreateSwapchain(device, surface, FRAMES_IN_FLIGHT);
+    auto window    = ngapi::createWindow("Compute", width, height);
+    auto surface   = ngapi::createSurface(window);
+    auto swapchain = gpuCreateSwapchain(device, surface, FRAMES_IN_FLIGHT);
 
     gpuDestroySemaphore(semaphore);
     semaphore = gpuCreateSemaphore(device, 0);
@@ -141,7 +126,6 @@ int main()
     gpuDestroySwapchain(swapchain);
     ngapi::destroySurface(window, surface);
     ngapi::destroyWindow(window);
-#endif
 
     stbi_image_free(inputImage);
     allocator.reset();

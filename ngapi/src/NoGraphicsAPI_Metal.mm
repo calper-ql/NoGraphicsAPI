@@ -1,7 +1,7 @@
 // Metal backend — covers gpuCreateDevice, gpuMalloc, gpuDispatch, textures,
-// samplers, and argument buffers; enough to run the headless compute samples
-// (multiplegpus, learning, compute). Windowed / surface / raytracing paths
-// are unimplemented stubs.
+// samplers, argument buffers, surface/swapchain (CAMetalLayer), and blit.
+// Runs the headless compute samples (multiplegpus, learning) and the windowed
+// compute sample (CAMetalLayer → ngapi::createWindow via window_metal.mm).
 //
 // Friction log (things that diverge from the Vulkan backend):
 //
@@ -52,6 +52,7 @@
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import <dispatch/dispatch.h>
 
 #define GPU_EXPOSE_INTERNAL
@@ -81,6 +82,9 @@ struct MetalDevice
 {
     id<MTLDevice> device;
 
+    // Lazily-compiled compute PSO used by gpuBlitTexture.
+    id<MTLComputePipelineState> blitPso = nil;
+
     std::mutex             allocMutex;
     std::vector<MetalAllocation> allocations;
 
@@ -105,6 +109,17 @@ struct MetalDevice
 
 struct GpuDevice_T          { MetalDevice* metalDevice = nullptr; };
 struct GpuTexture_T         { id<MTLTexture> texture; GpuDevice device; };
+
+// Swapchain image is a value embedded in GpuSwapchain_T; gpuSwapchainImage
+// returns a stable pointer to it — valid until the next call or gpuDestroySwapchain.
+struct GpuSwapchain_T
+{
+    CAMetalLayer*     layer;
+    id<MTLDrawable>   currentDrawable = nil;
+    GpuTexture_T      swapchainTex{};    // reused each frame
+    GpuDevice         device;
+    uint32_t          framesInFlight;
+};
 
 struct GpuPipeline_T
 {
@@ -163,8 +178,9 @@ struct GpuCommandBuffer_T
 };
 
 #ifdef GPU_SURFACE_EXTENSION
-struct GpuSurface_T   { void* placeholder; };
-struct GpuSwapchain_T { void* placeholder; };
+struct GpuSurface_T   { CAMetalLayer* layer; };
+// GpuSwapchain_T is defined above (before GpuPipeline_T) so gpuSwapchainImage
+// can return &swapchain->swapchainTex without a forward reference issue.
 #endif
 
 // ---------------------------------------------------------------------------
@@ -208,12 +224,16 @@ void gpuDestroyInstance()
 #ifdef GPU_EXPOSE_INTERNAL
 void* gpuVulkanInstance() { return nullptr; }
 
-GpuSurface gpuCreateSurface(void* /*vulkanSurface*/)
+// metalLayer is a CAMetalLayer* passed from window_metal.mm::createSurface().
+GpuSurface gpuCreateSurface(void* metalLayer)
 {
-    return new GpuSurface_T{};
+    return new GpuSurface_T{ (__bridge CAMetalLayer*)metalLayer };
 }
 
-void* gpuVulkanSurface(GpuSurface /*surface*/) { return nullptr; }
+void* gpuVulkanSurface(GpuSurface surface)
+{
+    return (__bridge void*)surface->layer;
+}
 
 void gpuDestroySurface(GpuSurface surface) { delete surface; }
 #endif
@@ -1088,9 +1108,53 @@ void gpuCopyFromTexture(GpuCommandBuffer cb, void* dstGpu, GpuTexture texture)
 destinationBytesPerImage:bpr * h];
 }
 
-void gpuBlitTexture(GpuCommandBuffer, GpuTexture, GpuTexture)
+// Inline blit shader: copies src (any readable format) → dst (read_write).
+// Metal's texture interface always presents channels as float4(r,g,b,a)
+// regardless of the underlying byte layout, so RGBA→BGRA copies are correct.
+static constexpr const char* kBlitMSL =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "[[kernel]] void ngapi_blit(\n"
+    "    texture2d<float, access::read>       src [[texture(0)]],\n"
+    "    texture2d<float, access::read_write> dst [[texture(1)]],\n"
+    "    uint2 gid [[thread_position_in_grid]])\n"
+    "{\n"
+    "    if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) return;\n"
+    "    dst.write(src.read(gid), gid);\n"
+    "}\n";
+
+static id<MTLComputePipelineState> getBlitPso(MetalDevice* md)
 {
-    assert(false && "Metal: gpuBlitTexture not implemented in spike");
+    if (md->blitPso) return md->blitPso;
+    NSError* err = nil;
+    NSString* msl = [NSString stringWithUTF8String:kBlitMSL];
+    MTLCompileOptions* opts = [MTLCompileOptions new];
+    opts.languageVersion = MTLLanguageVersion3_1;
+    id<MTLLibrary> lib = [md->device newLibraryWithSource:msl options:opts error:&err];
+    if (!lib) { NSLog(@"getBlitPso: %@", err); return nil; }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"ngapi_blit"];
+    md->blitPso = [md->device newComputePipelineStateWithFunction:fn error:&err];
+    if (!md->blitPso) NSLog(@"getBlitPso pipeline: %@", err);
+    return md->blitPso;
+}
+
+void gpuBlitTexture(GpuCommandBuffer cb, GpuTexture dst, GpuTexture src)
+{
+    auto* md  = cb->device->metalDevice;
+    auto  pso = getBlitPso(md);
+    if (!pso || !src || !dst) return;
+
+    auto enc = cb->compute();
+    [enc setComputePipelineState:pso];
+    [enc setTexture:src->texture atIndex:0];
+    [enc setTexture:dst->texture atIndex:1];
+    [enc useResource:src->texture usage:MTLResourceUsageRead];
+    [enc useResource:dst->texture usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+
+    NSUInteger w = dst->texture.width;
+    NSUInteger h = dst->texture.height;
+    [enc dispatchThreadgroups:MTLSizeMake((w + 7) / 8, (h + 7) / 8, 1)
+        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 }
 
 void gpuSetDepthStencilState(GpuCommandBuffer, GpuDepthStencilState) {}
@@ -1139,24 +1203,60 @@ void gpuDrawMeshletsIndirect(GpuCommandBuffer, void*, void*, void*)
 }
 
 // ---------------------------------------------------------------------------
-// Surface / swapchain stubs
+// Surface / swapchain
 // ---------------------------------------------------------------------------
 
 #ifdef GPU_SURFACE_EXTENSION
 
 Span<FORMAT> gpuSurfaceFormats(GpuDevice, GpuSurface) { return {}; }
 
-GpuSwapchain gpuCreateSwapchain(GpuDevice, GpuSurface, uint32_t)
+GpuSwapchain gpuCreateSwapchain(GpuDevice device, GpuSurface surface, uint32_t framesInFlight)
 {
-    assert(false && "Metal: swapchain not implemented in spike");
-    return nullptr;
+    CAMetalLayer* layer = surface->layer;
+    // Wire the device and cap the drawable count for CPU-side frame pacing.
+    layer.device             = device->metalDevice->device;
+    layer.maximumDrawableCount = framesInFlight < 2 ? 2 :
+                                 framesInFlight > 3 ? 3 : framesInFlight;
+
+    auto* sw             = new GpuSwapchain_T{};
+    sw->layer            = layer;
+    sw->device           = device;
+    sw->framesInFlight   = framesInFlight;
+    sw->swapchainTex.device = device;
+    return sw;
 }
 
 void gpuDestroySwapchain(GpuSwapchain swapchain) { delete swapchain; }
 
-GpuTextureDesc gpuSwapchainDesc(GpuSwapchain)       { return {}; }
-GpuTexture     gpuSwapchainImage(GpuSwapchain)      { return nullptr; }
-void           gpuPresent(GpuSwapchain, GpuSemaphore, uint64_t) {}
+GpuTextureDesc gpuSwapchainDesc(GpuSwapchain swapchain)
+{
+    GpuTextureDesc d{};
+    d.type       = TEXTURE_2D;
+    d.format     = FORMAT_BGRA8_SRGB; // closest NGAPI format for the BGRA8Unorm layer
+    d.dimensions = { (uint32_t)swapchain->layer.drawableSize.width,
+                     (uint32_t)swapchain->layer.drawableSize.height, 1 };
+    return d;
+}
+
+// Acquire the next CAMetalDrawable and return its texture wrapped in a
+// stable GpuTexture_T stored inside GpuSwapchain_T. Valid until the next
+// call or gpuDestroySwapchain.
+GpuTexture gpuSwapchainImage(GpuSwapchain swapchain)
+{
+    id<CAMetalDrawable> drawable = [swapchain->layer nextDrawable];
+    swapchain->currentDrawable   = drawable;
+    swapchain->swapchainTex.texture = drawable.texture;
+    return &swapchain->swapchainTex;
+}
+
+// Present the drawable acquired by gpuSwapchainImage. Must be called after
+// gpuSubmit — Metal schedules the present when the associated GPU work is done.
+void gpuPresent(GpuSwapchain swapchain, GpuSemaphore /*semaphore*/, uint64_t /*value*/)
+{
+    if (swapchain->currentDrawable)
+        [swapchain->currentDrawable present];
+    swapchain->currentDrawable = nil;
+}
 
 #endif // GPU_SURFACE_EXTENSION
 

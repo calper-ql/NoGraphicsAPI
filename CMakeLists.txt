@@ -270,9 +270,17 @@ add_custom_target(copy_assets_metal ALL
         "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${NGAPI_RUNTIME_DIR}/assets"
     COMMENT "Copying assets (Metal)")
 
+# Windowing for Metal samples: Cocoa + CAMetalLayer (no GLFW or SDL3).
+add_library(ngapi-platform-metal STATIC platform/window_metal.mm)
+target_include_directories(ngapi-platform-metal PUBLIC platform)
+target_link_libraries(ngapi-platform-metal PUBLIC ngapi::ngapi)
+target_link_libraries(ngapi-platform-metal PUBLIC
+    "-framework Cocoa" "-framework Metal" "-framework QuartzCore")
+
 add_executable(compute samples/compute/Compute.cpp)
 target_compile_definitions(compute PRIVATE GPU_METAL_BACKEND)
-target_link_libraries(compute PRIVATE ngapi::ngapi ngapi-samples-common stb glm::glm)
+target_link_libraries(compute PRIVATE
+    ngapi::ngapi ngapi-platform-metal ngapi-samples-common stb glm::glm)
 add_dependencies(compute metal_shaders copy_assets_metal)
 endif() # NGAPI_METAL_BACKEND
 
