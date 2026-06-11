@@ -141,6 +141,12 @@ compile_metal_shader(SOURCE samples/learning/Tensor.slang STAGE compute
     ENTRY _add _sub _mul _div _dot _mT _matmul _pow _tanh
     EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
 
+compile_metal_shader(SOURCE samples/compute/Compute.slang STAGE compute
+    OUTPUT compute/Compute.metal
+    ENTRY main
+    NUMTHREADS "16 16 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/compute/Compute.h")
+
 add_custom_target(metal_shaders ALL DEPENDS ${NGAPI_METAL_SHADER_OUTPUTS})
 endif() # NGAPI_METAL_BACKEND
 
@@ -258,6 +264,16 @@ if(NGAPI_METAL_BACKEND)
 add_executable(learning samples/learning/Learning.cpp samples/learning/Tensor.cpp)
 target_link_libraries(learning PRIVATE ngapi::ngapi ngapi-samples-common glm::glm)
 add_dependencies(learning metal_shaders)
+
+add_custom_target(copy_assets_metal ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${NGAPI_RUNTIME_DIR}/assets"
+    COMMENT "Copying assets (Metal)")
+
+add_executable(compute samples/compute/Compute.cpp)
+target_compile_definitions(compute PRIVATE GPU_METAL_BACKEND)
+target_link_libraries(compute PRIVATE ngapi::ngapi ngapi-samples-common stb glm::glm)
+add_dependencies(compute metal_shaders copy_assets_metal)
 endif() # NGAPI_METAL_BACKEND
 
 endif() # NGA_BUILD_SAMPLES

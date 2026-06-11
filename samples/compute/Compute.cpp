@@ -1,9 +1,12 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 
+#include <cstdio>
 #include <cstring>
 
+#ifndef GPU_METAL_BACKEND
 #include "window.h"
+#endif
 
 #include "Compute.h"
 #include "Utilities.h"
@@ -13,20 +16,16 @@ int main()
     gpuCreateInstance();
     auto device = gpuCreateDevice(0);
 
-    const uint FRAMES_IN_FLIGHT = 2;
-
-    auto window = ngapi::createWindow("Test Window", 1920, 1080);
-    auto surface = ngapi::createSurface(window);
-
     LinearAllocator allocator(device);
 
-    auto swapchain = gpuCreateSwapchain(device, surface, FRAMES_IN_FLIGHT);
-    auto swapchainDesc = gpuSwapchainDesc(swapchain);
-
-    auto queue = gpuCreateQueue(device);
+    auto queue     = gpuCreateQueue(device);
     auto semaphore = gpuCreateSemaphore(device, 0);
 
+#ifdef GPU_METAL_BACKEND
+    auto computeIR = loadIR("shaders/compute/Compute.metal");
+#else
     auto computeIR = loadIR("shaders/compute/Compute.spv");
+#endif
     auto pipeline = gpuCreateComputePipeline(device, ByteSpan(computeIR.data(), computeIR.size()));
 
     auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);
@@ -34,70 +33,94 @@ int main()
     // Load input image
     int width, height, channels;
     stbi_uc* inputImage = stbi_load("assets/Default.png", &width, &height, &channels, 4);
+    if (!inputImage)
+    {
+        fprintf(stderr, "compute: failed to load assets/Default.png\n");
+        return 1;
+    }
 
-    auto upload = allocator.allocate<uint8_t>(width * height * 4);
-    memcpy(upload.cpu, inputImage, width * height * 4);
+    auto upload = allocator.allocate<uint8_t>((size_t)width * height * 4);
+    memcpy(upload.cpu, inputImage, (size_t)width * height * 4);
 
     GpuTextureDesc textureDesc{
-        .type = TEXTURE_2D,
-        .dimensions = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
-        .format = FORMAT_RGBA8_UNORM,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_SAMPLED | USAGE_TRANSFER_DST)
+        .type       = TEXTURE_2D,
+        .dimensions = { (uint32_t)width, (uint32_t)height, 1 },
+        .format     = FORMAT_RGBA8_UNORM,
+        .usage      = (USAGE_FLAGS)(USAGE_SAMPLED | USAGE_TRANSFER_DST)
     };
 
     GpuTextureSizeAlign textureSizeAlign = gpuTextureSizeAlign(device, textureDesc);
     void* texturePtr = gpuMalloc(device, textureSizeAlign.size, MEMORY_GPU);
     auto texture = gpuCreateTexture(device, textureDesc, texturePtr);
 
-    GpuTextureDesc outputTextureDes{
-        .type = TEXTURE_2D,
-        .dimensions = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
-        .format = FORMAT_RGBA8_UNORM,
-        .usage = static_cast<USAGE_FLAGS>(USAGE_STORAGE | USAGE_TRANSFER_SRC)
+    GpuTextureDesc outputTextureDesc{
+        .type       = TEXTURE_2D,
+        .dimensions = { (uint32_t)width, (uint32_t)height, 1 },
+        .format     = FORMAT_RGBA8_UNORM,
+        .usage      = (USAGE_FLAGS)(USAGE_STORAGE | USAGE_TRANSFER_SRC)
     };
 
     void* outputPtr = gpuMalloc(device, textureSizeAlign.size, MEMORY_GPU);
-    auto outputTexture = gpuCreateTexture(device, outputTextureDes, outputPtr);
+    auto outputTexture = gpuCreateTexture(device, outputTextureDesc, outputPtr);
 
-    textureHeap.cpu[0] = gpuTextureViewDescriptor(texture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
+    textureHeap.cpu[0] = gpuTextureViewDescriptor  (texture,       GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
     textureHeap.cpu[1] = gpuRWTextureViewDescriptor(outputTexture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
 
-    auto commandBuffer = gpuStartCommandRecording(queue);
-    gpuCopyToTexture(commandBuffer, upload.gpu, texture);
-    gpuSubmit(queue, Span<GpuCommandBuffer>(&commandBuffer, 1), semaphore, 1);
-    gpuWaitSemaphore(semaphore, 1);
+    // Upload input image to GPU texture
+    {
+        auto cb = gpuStartCommandRecording(queue);
+        gpuCopyToTexture(cb, upload.gpu, texture);
+        gpuSubmit(queue, Span<GpuCommandBuffer>(&cb, 1), semaphore, 1);
+        gpuWaitSemaphore(semaphore, 1);
+    }
 
-    auto data = allocator.allocate<ComputeData>(1);
-
-    data.cpu->imageSize = { static_cast<uint32_t>(width), static_cast<uint32_t>(height) };
-    data.cpu->srcTexture = 0;
-    data.cpu->dstTexture = 1;
-
-    // Attach a regular buffer: allocate an array of Tint structs, fill it on the
-    // CPU, and hand its GPU pointer to the shader through the data struct. Nothing
-    // is bound — the shader just follows `data->tints` to read whatever we point
-    // it at, so the size and contents are entirely decided here at runtime.
+    // Per-band tint data
     const uint32_t tintCount = 4;
     auto tints = allocator.allocate<Tint>(tintCount);
-    tints.cpu[0] = { { 1.0f, 0.5f, 0.5f }, 0.6f }; // red band
-    tints.cpu[1] = { { 0.5f, 1.0f, 0.5f }, 0.6f }; // green band
-    tints.cpu[2] = { { 0.5f, 0.5f, 1.0f }, 0.6f }; // blue band
-    tints.cpu[3] = { { 1.0f, 1.0f, 0.5f }, 0.6f }; // yellow band
+    tints.cpu[0] = { { 1.0f, 0.5f, 0.5f }, 0.6f }; // red
+    tints.cpu[1] = { { 0.5f, 1.0f, 0.5f }, 0.6f }; // green
+    tints.cpu[2] = { { 0.5f, 0.5f, 1.0f }, 0.6f }; // blue
+    tints.cpu[3] = { { 1.0f, 1.0f, 0.5f }, 0.6f }; // yellow
 
-    data.cpu->tints = tints.gpu;
-    data.cpu->tintCount = tintCount;
+    auto data = allocator.allocate<ComputeData>(1);
+    data.cpu->imageSize  = { (uint32_t)width, (uint32_t)height };
+    data.cpu->srcTexture = 0;
+    data.cpu->dstTexture = 1;
+    data.cpu->tints      = tints.gpu;
+    data.cpu->tintCount  = tintCount;
 
-    commandBuffer = gpuStartCommandRecording(queue);
-    gpuSetPipeline(commandBuffer, pipeline);
-    gpuSetActiveTextureHeapPtr(commandBuffer, textureHeap.gpu);
-    gpuDispatch(commandBuffer, data.gpu, { static_cast<uint32_t>(width / 16), static_cast<uint32_t>(height / 16), 1 });
+    // Dispatch compute
+    {
+        auto cb = gpuStartCommandRecording(queue);
+        gpuSetPipeline(cb, pipeline);
+        gpuSetActiveTextureHeapPtr(cb, textureHeap.gpu);
+        gpuDispatch(cb, data.gpu,
+            { (uint32_t)(width / 16), (uint32_t)(height / 16), 1 });
+        gpuSubmit(queue, Span<GpuCommandBuffer>(&cb, 1), semaphore, 2);
+        gpuWaitSemaphore(semaphore, 2);
+    }
 
-    gpuSubmit(queue, Span<GpuCommandBuffer>(&commandBuffer, 1), semaphore, 2);
-    gpuWaitSemaphore(semaphore, 2);
+#ifdef GPU_METAL_BACKEND
+    // Headless path: read back the result and write to a PNG.
+    auto readback = allocator.allocate<uint8_t>((size_t)width * height * 4);
+    {
+        auto cb = gpuStartCommandRecording(queue);
+        gpuCopyFromTexture(cb, readback.gpu, outputTexture);
+        gpuSubmit(queue, Span<GpuCommandBuffer>(&cb, 1), semaphore, 3);
+        gpuWaitSemaphore(semaphore, 3);
+    }
+    const char* outFile = "output_compute.png";
+    stbi_write_png(outFile, width, height, 4, readback.cpu, width * 4);
+    printf("compute: wrote %s  (%dx%d)\n", outFile, width, height);
+#else
+    // Windowed path: blit the result to the swapchain in a render loop.
+    const uint FRAMES_IN_FLIGHT = 2;
+    auto window       = ngapi::createWindow("Compute", 1920, 1080);
+    auto surface      = ngapi::createSurface(window);
+    auto swapchain    = gpuCreateSwapchain(device, surface, FRAMES_IN_FLIGHT);
 
     gpuDestroySemaphore(semaphore);
     semaphore = gpuCreateSemaphore(device, 0);
-
     uint64_t nextFrame = 1;
 
     while (!ngapi::shouldClose(window))
@@ -105,30 +128,22 @@ int main()
         ngapi::pollEvents(window);
 
         if (nextFrame > FRAMES_IN_FLIGHT)
-        {
             gpuWaitSemaphore(semaphore, nextFrame - FRAMES_IN_FLIGHT);
-        }
 
-        commandBuffer = gpuStartCommandRecording(queue);
-
+        auto cb    = gpuStartCommandRecording(queue);
         auto image = gpuSwapchainImage(swapchain);
-        gpuBlitTexture(commandBuffer, image, outputTexture);
-        gpuSubmit(queue, Span<GpuCommandBuffer>(&commandBuffer, 1), semaphore, nextFrame);
+        gpuBlitTexture(cb, image, outputTexture);
+        gpuSubmit(queue, Span<GpuCommandBuffer>(&cb, 1), semaphore, nextFrame);
         gpuPresent(swapchain, semaphore, nextFrame++);
     }
 
     gpuWaitSemaphore(semaphore, nextFrame - 1);
-
-    // Destroy the swapchain first: it drains all queues (including the present
-    // queue) and releases the swapchain images, present semaphores and surface
-    // before the device/instance are torn down. Destroying the device while
-    // these children are still alive hangs drivers that honour object lifetimes.
     gpuDestroySwapchain(swapchain);
     ngapi::destroySurface(window, surface);
     ngapi::destroyWindow(window);
+#endif
 
     stbi_image_free(inputImage);
-
     allocator.reset();
 
     gpuDestroySemaphore(semaphore);

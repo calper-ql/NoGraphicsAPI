@@ -1,6 +1,7 @@
-// Metal backend — covers gpuCreateDevice, gpuMalloc, gpuDispatch and enough
-// glue to run the headless samples (multiplegpus, learning). Windowed /
-// surface / raytracing paths are unimplemented stubs.
+// Metal backend — covers gpuCreateDevice, gpuMalloc, gpuDispatch, textures,
+// samplers, and argument buffers; enough to run the headless compute samples
+// (multiplegpus, learning, compute). Windowed / surface / raytracing paths
+// are unimplemented stubs.
 //
 // Friction log (things that diverge from the Vulkan backend):
 //
@@ -23,8 +24,6 @@
 //      (.metal files produced by `slangc -target metal`) at pipeline creation
 //      time. gpuCreateComputePipeline detects the MTLB magic header for pre-
 //      compiled .metallib, and falls back to runtime MSL compilation otherwise.
-//      Xcode pre-compilation (xcrun metal → .air → xcrun metallib) is a
-//      future improvement.
 //
 //   4. Timeline semaphores: mapped 1:1 onto MTLSharedEvent, which supports
 //      signaling at a value and notifying a listener at a threshold — identical
@@ -33,6 +32,23 @@
 //   5. MEMORY_GPU: Private storage mode has no CPU-visible pointer. We return
 //      the MTLBuffer's GPU address cast to void* (same convention as the Vulkan
 //      backend's MEMORY_GPU path, which returns the VkDeviceAddress).
+//
+//   6. Inline samplers: Slang emits `ngapiSamplerHeap[0x4Exxxxxx]` where the
+//      magic value encodes sampler state. We scan the MSL source at pipeline
+//      creation, decode each unique magic value into an MTLSamplerState, assign
+//      compact slot indices (0, 1, 2, …), patch the source, and bind a sampler
+//      argument buffer at dispatch time.
+//
+//   7. Bindless texture/sampler heaps: Slang emits `textureHeap[]`,
+//      `rwTextureHeap[]`, and `ngapiSamplerHeap[]` as unbounded kernel
+//      parameters. These become Metal Tier-2 argument buffers. The CPU-side
+//      GpuTextureDescriptor stores the id<MTLTexture> raw pointer; gpuDispatch
+//      builds argument buffers from it on every call.
+//
+//   8. Threadgroup size: Slang does NOT emit `[[max_total_threads_per_threadgroup]]`
+//      in Metal output. The build system embeds "// NGAPI_THREADS X Y Z" at the
+//      top of each .metal file; gpuCreateComputePipeline reads it and stores the
+//      size in GpuPipeline_T. Defaults to {64,1,1} when the comment is absent.
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -42,10 +58,12 @@
 #include "NoGraphicsAPI.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <cassert>
-#include <cstring>
 
 // ---------------------------------------------------------------------------
 // Internal structs
@@ -85,14 +103,27 @@ struct MetalDevice
     }
 };
 
-struct GpuDevice_T            { MetalDevice*                metalDevice = nullptr; };
+struct GpuDevice_T          { MetalDevice* metalDevice = nullptr; };
+struct GpuTexture_T         { id<MTLTexture> texture; GpuDevice device; };
+
 struct GpuPipeline_T
 {
     id<MTLComputePipelineState> pso;
-    GpuDevice  device;
-    NSUInteger entryParamsIndex = 0;   // [[buffer(N)]] index for EntryPointParams
-    NSUInteger threadgroupSize  = 64;  // threads per group; matches [numthreads] in the shader
+    id<MTLFunction>             fn;               // retained for argument encoder creation
+    GpuDevice                   device;
+    NSUInteger                  entryParamsIndex   = 0;
+    uint3                       threadgroupSize    = {64, 1, 1};
+
+    // Buffer indices in the kernel for each resource array (NSUIntegerMax = absent)
+    NSUInteger textureHeapIndex   = NSUIntegerMax;
+    NSUInteger rwTextureHeapIndex = NSUIntegerMax;
+    NSUInteger samplerHeapIndex   = NSUIntegerMax;
+
+    // Sampler argument buffer — built once at pipeline creation from inline
+    // sampler literals found in the MSL source.
+    id<MTLBuffer> samplerArgBuf = nil;
 };
+
 struct GpuQueue_T             { id<MTLCommandQueue>         queue; GpuDevice device; };
 struct GpuSemaphore_T         { id<MTLSharedEvent>          event; GpuDevice device; };
 struct GpuDepthStencilState_T { GpuDepthStencilDesc desc; };
@@ -108,6 +139,7 @@ struct GpuCommandBuffer_T
     id<MTLComputeCommandEncoder>  computeEnc = nil;
     GpuPipeline currentPipeline = nullptr;
     GpuDevice   device;
+    void*       activeTextureHeapGpu = nullptr; // set by gpuSetActiveTextureHeapPtr
 
     id<MTLBlitCommandEncoder> blit()
     {
@@ -263,8 +295,6 @@ static void* mallocImpl(MetalDevice* md, size_t bytes, size_t align, MEMORY memo
         md->allocations.push_back(a);
     }
 
-    // Match the Vulkan convention: MEMORY_GPU returns the GPU address cast to
-    // void* (not a CPU pointer), everything else returns the CPU pointer.
     return cpuVisible ? [buf contents] : reinterpret_cast<void*>(a.gpuAddr);
 }
 
@@ -301,31 +331,275 @@ void* gpuHostToDevicePointer(GpuDevice device, void* ptr)
 }
 
 // ---------------------------------------------------------------------------
-// Textures (stubs — not implemented for this spike)
+// Format / texture helpers
+// ---------------------------------------------------------------------------
+
+static MTLPixelFormat metalPixelFormat(FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case FORMAT_RGBA8_UNORM:    return MTLPixelFormatRGBA8Unorm;
+    case FORMAT_BGRA8_SRGB:     return MTLPixelFormatBGRA8Unorm_sRGB;
+    case FORMAT_D32_FLOAT:      return MTLPixelFormatDepth32Float;
+    case FORMAT_RG11B10_FLOAT:  return MTLPixelFormatRG11B10Float;
+    case FORMAT_RGB10_A2_UNORM: return MTLPixelFormatRGB10A2Unorm;
+    case FORMAT_RG32_FLOAT:     return MTLPixelFormatRG32Float;
+    case FORMAT_RGBA32_FLOAT:   return MTLPixelFormatRGBA32Float;
+    case FORMAT_RGBA16_FLOAT:   return MTLPixelFormatRGBA16Float;
+    case FORMAT_RGB32_FLOAT:    return MTLPixelFormatInvalid; // no packed RGB32 in Metal
+    default:                    return MTLPixelFormatInvalid;
+    }
+}
+
+static MTLTextureType metalTextureType(TEXTURE type)
+{
+    switch (type)
+    {
+    case TEXTURE_1D:         return MTLTextureType1D;
+    case TEXTURE_2D:         return MTLTextureType2D;
+    case TEXTURE_3D:         return MTLTextureType3D;
+    case TEXTURE_CUBE:       return MTLTextureTypeCube;
+    case TEXTURE_2D_ARRAY:   return MTLTextureType2DArray;
+    case TEXTURE_CUBE_ARRAY: return MTLTextureTypeCubeArray;
+    default:                 return MTLTextureType2D;
+    }
+}
+
+static MTLTextureUsage metalTextureUsage(USAGE_FLAGS flags)
+{
+    MTLTextureUsage usage = MTLTextureUsageUnknown;
+    if (flags & USAGE_SAMPLED)                  usage |= MTLTextureUsageShaderRead;
+    if (flags & USAGE_STORAGE)                  usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    if (flags & USAGE_COLOR_ATTACHMENT)         usage |= MTLTextureUsageRenderTarget;
+    if (flags & USAGE_DEPTH_STENCIL_ATTACHMENT) usage |= MTLTextureUsageRenderTarget;
+    return usage;
+}
+
+static NSUInteger metalBytesPerPixel(MTLPixelFormat fmt)
+{
+    switch (fmt)
+    {
+    case MTLPixelFormatRGBA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB:
+    case MTLPixelFormatRGB10A2Unorm:
+    case MTLPixelFormatRG11B10Float:
+    case MTLPixelFormatDepth32Float:
+        return 4;
+    case MTLPixelFormatRGBA16Float:
+    case MTLPixelFormatRG32Float:
+        return 8;
+    case MTLPixelFormatRGBA32Float:
+        return 16;
+    default:
+        return 4;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sampler helpers
+// ---------------------------------------------------------------------------
+
+static MTLSamplerAddressMode metalAddressMode(uint32_t mode)
+{
+    switch (mode)
+    {
+    case 0:  return MTLSamplerAddressModeRepeat;
+    case 1:  return MTLSamplerAddressModeClampToEdge;
+    case 2:  return MTLSamplerAddressModeMirrorRepeat;
+    case 3:  return MTLSamplerAddressModeClampToBorderColor;
+    case 4:  return MTLSamplerAddressModeMirrorClampToEdge;
+    default: return MTLSamplerAddressModeRepeat;
+    }
+}
+
+static MTLSamplerBorderColor metalBorderColor(uint32_t b)
+{
+    switch (b)
+    {
+    case 1:  return MTLSamplerBorderColorOpaqueBlack;
+    case 2:  return MTLSamplerBorderColorOpaqueWhite;
+    default: return MTLSamplerBorderColorTransparentBlack;
+    }
+}
+
+static MTLCompareFunction metalCompareFunction(uint32_t op)
+{
+    switch (op)
+    {
+    case 1:  return MTLCompareFunctionNever;
+    case 2:  return MTLCompareFunctionLess;
+    case 3:  return MTLCompareFunctionEqual;
+    case 4:  return MTLCompareFunctionLessEqual;
+    case 5:  return MTLCompareFunctionGreater;
+    case 6:  return MTLCompareFunctionNotEqual;
+    case 7:  return MTLCompareFunctionGreaterEqual;
+    case 8:  return MTLCompareFunctionAlways;
+    default: return MTLCompareFunctionNever; // COMPARE_NONE → not a shadow sampler
+    }
+}
+
+// Decode an NGAPI packed sampler state (lower 24 bits of an INLINE_SAMPLER value)
+// into an MTLSamplerState.
+//
+// Bit layout (from Sampler.h NGAPI_SAMPLER_BITS):
+//   bit  0     minFilter
+//   bit  1     magFilter
+//   bit  2     mipFilter
+//   bits 3-5   addressU
+//   bits 6-8   addressV
+//   bits 9-11  addressW
+//   bits 12-16 maxAnisotropy
+//   bits 17-18 borderColor
+//   bits 19-22 compareOp (0 = none, 1..8 = VK-style ops)
+static id<MTLSamplerState> createSamplerFromBits(id<MTLDevice> device, uint32_t bits)
+{
+    MTLSamplerDescriptor* desc = [MTLSamplerDescriptor new];
+    desc.minFilter       = (bits & 0x01) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    desc.magFilter       = (bits & 0x02) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    desc.mipFilter       = (bits & 0x04) ? MTLSamplerMipFilterLinear   : MTLSamplerMipFilterNearest;
+    desc.sAddressMode    = metalAddressMode((bits >>  3) & 0x7);
+    desc.tAddressMode    = metalAddressMode((bits >>  6) & 0x7);
+    desc.rAddressMode    = metalAddressMode((bits >>  9) & 0x7);
+    uint32_t aniso       = (bits >> 12) & 0x1F;
+    desc.maxAnisotropy   = (aniso == 0) ? 1 : aniso;
+    desc.borderColor     = metalBorderColor((bits >> 17) & 0x3);
+    desc.compareFunction = metalCompareFunction((bits >> 19) & 0xF);
+    return [device newSamplerStateWithDescriptor:desc];
+}
+
+// Scan MSL source for Slang inline-sampler magic literals (top byte == 0x4E),
+// replace each with a compact slot index, and create MTLSamplerState objects.
+// Returns the patched MSL string; appends to outSamplers (sampler at slot i).
+static std::string patchInlineSamplers(
+    const std::string&              src,
+    id<MTLDevice>                   device,
+    std::vector<id<MTLSamplerState>>& outSamplers)
+{
+    // Inline sampler magic: top byte == 0x4E (see INLINE_SAMPLER_MAGIC in Sampler.h)
+    static constexpr uint32_t MAGIC_MASK = 0xFF000000u;
+    static constexpr uint32_t MAGIC_VAL  = 0x4E000000u;
+
+    struct SamplerEntry { uint32_t bits; uint32_t slot; };
+    std::vector<SamplerEntry> seen;
+
+    std::string result;
+    result.reserve(src.size());
+
+    size_t i = 0;
+    while (i < src.size())
+    {
+        if (!isdigit((unsigned char)src[i]))
+        {
+            result += src[i++];
+            continue;
+        }
+
+        // Scan a run of digits
+        size_t j = i;
+        while (j < src.size() && isdigit((unsigned char)src[j])) ++j;
+
+        bool hasU = (j < src.size()) && (src[j] == 'U' || src[j] == 'u');
+        if (!hasU)
+        {
+            result.append(src, i, j - i);
+            i = j;
+            continue;
+        }
+
+        // Parse the number; cap at uint32 to avoid overflow
+        uint64_t val64 = 0;
+        bool overflow = false;
+        for (size_t k = i; k < j; ++k)
+        {
+            val64 = val64 * 10 + (unsigned char)(src[k] - '0');
+            if (val64 > 0xFFFFFFFFull) { overflow = true; break; }
+        }
+
+        if (!overflow && ((uint32_t)val64 & MAGIC_MASK) == MAGIC_VAL)
+        {
+            uint32_t bits = (uint32_t)val64 & ~MAGIC_MASK;
+
+            uint32_t slot = (uint32_t)outSamplers.size();
+            for (const auto& e : seen)
+                if (e.bits == bits) { slot = e.slot; goto found_slot; }
+
+            // New unique sampler
+            seen.push_back({bits, slot});
+            outSamplers.push_back(createSamplerFromBits(device, bits));
+
+            found_slot:
+            result += std::to_string(slot);
+            result += src[j]; // 'U' or 'u'
+            i = j + 1;
+            continue;
+        }
+
+        // Not a sampler literal — copy verbatim including the U suffix
+        result.append(src, i, (j - i) + 1);
+        i = j + 1;
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Textures
 // ---------------------------------------------------------------------------
 
 GpuTextureSizeAlign gpuTextureSizeAlign(GpuDevice, GpuTextureDesc)
 {
-    assert(false && "Metal: textures not implemented in spike");
-    return {};
+    // Metal creates textures as standalone objects; the caller's gpuMalloc
+    // allocation (texturePtr) is a token we ignore at texture creation time.
+    // Return a minimal size so gpuMalloc doesn't allocate a zero-byte buffer.
+    return { GPU_DEFAULT_ALIGNMENT, GPU_DEFAULT_ALIGNMENT };
 }
 
-GpuTexture gpuCreateTexture(GpuDevice, GpuTextureDesc, void*)
+GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* /*ptrGpu*/)
 {
-    assert(false && "Metal: textures not implemented in spike");
-    return nullptr;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
+    td.textureType      = metalTextureType(desc.type);
+    td.pixelFormat      = metalPixelFormat(desc.format);
+    td.width            = desc.dimensions.x;
+    td.height           = (desc.type == TEXTURE_1D) ? 1 : desc.dimensions.y;
+    td.depth            = (desc.type == TEXTURE_3D) ? desc.dimensions.z : 1;
+    td.mipmapLevelCount = desc.mipCount;
+    td.arrayLength      = (desc.type == TEXTURE_2D_ARRAY || desc.type == TEXTURE_CUBE_ARRAY)
+                              ? desc.layerCount : 1;
+    td.sampleCount      = desc.sampleCount;
+    td.usage            = metalTextureUsage(desc.usage);
+    td.storageMode      = MTLStorageModePrivate;
+
+    id<MTLTexture> tex = [device->metalDevice->device newTextureWithDescriptor:td];
+    if (!tex)
+    {
+        NSLog(@"gpuCreateTexture: newTextureWithDescriptor failed");
+        return nullptr;
+    }
+    return new GpuTexture_T{ tex, device };
 }
 
-void gpuDestroyTexture(GpuTexture) {}
-
-GpuTextureDescriptor gpuTextureViewDescriptor(GpuTexture, GpuViewDesc)
+void gpuDestroyTexture(GpuTexture texture)
 {
-    return {};
+    delete texture;
 }
 
-GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuTexture, GpuViewDesc)
+// Pack the id<MTLTexture> raw pointer into GpuTextureDescriptor so gpuDispatch
+// can reconstruct it. data[1]=0 → sampled (textureHeap[]), data[1]=1 → storage
+// (rwTextureHeap[]). The caller must keep the owning GpuTexture alive.
+GpuTextureDescriptor gpuTextureViewDescriptor(GpuTexture texture, GpuViewDesc)
 {
-    return {};
+    GpuTextureDescriptor d = {};
+    d.data[0] = (uint64_t)(__bridge void*)texture->texture;
+    d.data[1] = 0; // sampled
+    return d;
+}
+
+GpuTextureDescriptor gpuRWTextureViewDescriptor(GpuTexture texture, GpuViewDesc)
+{
+    GpuTextureDescriptor d = {};
+    d.data[0] = (uint64_t)(__bridge void*)texture->texture;
+    d.data[1] = 1; // storage / read-write
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +616,21 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     bool isMetallib = ir.size() >= 4
         && ir[0] == 0x4D && ir[1] == 0x54 && ir[2] == 0x4C && ir[3] == 0x42;
 
+    // --- Threadgroup size: read "// NGAPI_THREADS X Y Z" from first line ---
+    uint3 tgSize = {64, 1, 1};
+    if (!isMetallib && ir.size() > 20)
+    {
+        const char* p = reinterpret_cast<const char*>(ir.data());
+        if (strncmp(p, "// NGAPI_THREADS ", 17) == 0)
+        {
+            unsigned x = 64, y = 1, z = 1;
+            sscanf(p + 17, "%u %u %u", &x, &y, &z);
+            tgSize = {x, y, z};
+        }
+    }
+
+    std::vector<id<MTLSamplerState>> samplers;
+
     if (isMetallib)
     {
         dispatch_data_t data = dispatch_data_create(
@@ -350,16 +639,15 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     }
     else
     {
-        // Treat bytes as UTF-8 MSL source.
-        // MSL 3.1 (macOS 14+) is required for Slang's calling convention:
-        // loading a device* from constant memory and dereferencing it directly
-        // (the EntryPointParams pattern) is only valid in MSL 3.0+.
-        NSString* src = [[NSString alloc] initWithBytes:ir.data()
-                                                 length:ir.size()
-                                               encoding:NSUTF8StringEncoding];
+        // Treat bytes as UTF-8 MSL source. Patch inline sampler magic literals
+        // before compilation so the ngapiSamplerHeap index stays small.
+        std::string src(reinterpret_cast<const char*>(ir.data()), ir.size());
+        std::string patched = patchInlineSamplers(src, md->device, samplers);
+
+        NSString* msl = [NSString stringWithUTF8String:patched.c_str()];
         MTLCompileOptions* opts = [MTLCompileOptions new];
         opts.languageVersion = MTLLanguageVersion3_1;
-        lib = [md->device newLibraryWithSource:src options:opts error:&err];
+        lib = [md->device newLibraryWithSource:msl options:opts error:&err];
     }
 
     if (!lib)
@@ -368,11 +656,14 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
         return nullptr;
     }
 
-    NSString* entryName = entry ? [NSString stringWithUTF8String:entry] : @"main0";
+    // Slang renames 'main' to 'main_0' in Metal output (main is reserved in C).
+    NSString* entryName = entry ? [NSString stringWithUTF8String:entry] : @"main_0";
+    if ([entryName isEqualToString:@"main"]) entryName = @"main_0";
+
     id<MTLFunction> fn = [lib newFunctionWithName:entryName];
     if (!fn)
     {
-        NSLog(@"gpuCreateComputePipeline: entry '%s' not found", entry ? entry : "main0");
+        NSLog(@"gpuCreateComputePipeline: entry '%@' not found", entryName);
         return nullptr;
     }
 
@@ -388,20 +679,48 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
         return nullptr;
     }
 
-    // Find the [[buffer(N)]] index that Slang assigned to EntryPointParams.
-    // Single-entry .metal files always produce N=0; multi-entry files assign
-    // N by position. Reflection is the authoritative source.
-    NSUInteger paramsIndex = 0;
+    // Discover binding indices from reflection.
+    NSUInteger paramsIndex    = 0;
+    NSUInteger texHeapIdx     = NSUIntegerMax;
+    NSUInteger rwTexHeapIdx   = NSUIntegerMax;
+    NSUInteger samplerHeapIdx = NSUIntegerMax;
     for (id<MTLBinding> b in refl.bindings)
     {
-        if (b.type == MTLBindingTypeBuffer && [b.name hasPrefix:@"entryPointParams"])
-        {
-            paramsIndex = b.index;
-            break;
-        }
+        if (b.type != MTLBindingTypeBuffer) continue;
+        if ([b.name hasPrefix:@"rwTextureHeap"])          rwTexHeapIdx   = b.index;
+        else if ([b.name hasPrefix:@"textureHeap"])        texHeapIdx     = b.index;
+        else if ([b.name hasPrefix:@"ngapiSamplerHeap"])   samplerHeapIdx = b.index;
+        else if ([b.name hasPrefix:@"entryPointParams"])   paramsIndex    = b.index;
     }
 
-    return new GpuPipeline_T{ pso, device, paramsIndex, 64 };
+    // Pre-build sampler argument buffer (stays constant for this pipeline).
+    id<MTLBuffer> samplerArgBuf = nil;
+    if (!samplers.empty() && samplerHeapIdx != NSUIntegerMax)
+    {
+        MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
+        ad.dataType    = MTLDataTypeSampler;
+        ad.index       = 0;
+        ad.arrayLength = samplers.size();
+
+        id<MTLArgumentEncoder> enc = [md->device newArgumentEncoderWithArguments:@[ad]];
+        samplerArgBuf = [md->device newBufferWithLength:enc.encodedLength
+                                               options:MTLResourceStorageModeShared];
+        [enc setArgumentBuffer:samplerArgBuf offset:0];
+        for (NSUInteger i = 0; i < (NSUInteger)samplers.size(); ++i)
+            [enc setSamplerState:samplers[i] atIndex:i];
+    }
+
+    auto* p              = new GpuPipeline_T{};
+    p->pso               = pso;
+    p->fn                = fn;
+    p->device            = device;
+    p->entryParamsIndex  = paramsIndex;
+    p->threadgroupSize   = tgSize;
+    p->textureHeapIndex  = texHeapIdx;
+    p->rwTextureHeapIndex= rwTexHeapIdx;
+    p->samplerHeapIndex  = samplerHeapIdx;
+    p->samplerArgBuf     = samplerArgBuf;
+    return p;
 }
 
 GpuPipeline gpuCreateGraphicsPipeline(GpuDevice, ByteSpan, ByteSpan, GpuRasterDesc)
@@ -463,15 +782,13 @@ GpuCommandBuffer gpuStartCommandRecording(GpuQueue queue)
 void gpuSetPipeline(GpuCommandBuffer cb, GpuPipeline pipeline)
 {
     cb->currentPipeline = pipeline;
-    // Encode pipeline state immediately; the compute encoder is kept alive
-    // until another encoder type is needed or the command buffer is submitted.
     auto enc = cb->compute();
     [enc setComputePipelineState:pipeline->pso];
 }
 
-void gpuSetActiveTextureHeapPtr(GpuCommandBuffer /*cb*/, void* /*ptrGpu*/)
+void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
 {
-    // No-op for the spike — texture heap binding is not implemented.
+    cb->activeTextureHeapGpu = ptrGpu;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,32 +796,126 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer /*cb*/, void* /*ptrGpu*/)
 // ---------------------------------------------------------------------------
 //
 // Slang's MSL output wraps entry-point parameters in
-//   `EntryPointParams_N constant* entryPointParams_N [[buffer(N)]]`
-// where the struct holds a device pointer to the user's data struct.
-// We pass the 8-byte GPU address via setBytes — the GPU reads it as a device
-// pointer and dereferences it directly (Apple Silicon unified address space).
-// N is stored in pipeline->entryParamsIndex (discovered via reflection at
-// pipeline creation time).
+//   `device EntryPointParams_N* entryPointParams_N [[buffer(N)]]`
+// (after the address-space patch applied at build time). We pass the 8-byte
+// GPU address of the user struct and let the shader dereference it.
+//
+// For textured compute shaders, we also build Tier-2 argument buffers for
+// textureHeap[], rwTextureHeap[], and ngapiSamplerHeap[] and bind them at
+// the buffer indices discovered via reflection at pipeline creation.
 
 void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
 {
     auto* md  = cb->device->metalDevice;
     auto  enc = cb->compute();
+    auto* pl  = cb->currentPipeline;
 
-    // Pack the 8-byte GPU address into a device-accessible buffer.
-    // The MSL kernel declares `device EntryPointParams_N* p [[buffer(N)]]`
-    // where EntryPointParams contains a device* to the actual data struct.
+    // Bind the entry-point params (GPU address of the user data struct).
     uint64_t addr = reinterpret_cast<uint64_t>(dataGpu);
     id<MTLBuffer> paramBuf = [md->device newBufferWithBytes:&addr
                                                      length:sizeof(addr)
                                                     options:MTLResourceStorageModeShared];
-    [enc setBuffer:paramBuf
-            offset:0
-           atIndex:cb->currentPipeline->entryParamsIndex];
+    [enc setBuffer:paramBuf offset:0 atIndex:pl->entryParamsIndex];
 
-    // Metal requires every buffer accessed via device-pointer indirection to be
-    // declared to the encoder so the GPU can map it. Declare all live allocations
-    // read+write. (An MTLHeap would be more efficient; this is correct for Phase 1.)
+    // Bind texture / sampler argument buffers when the heap pointer has been set
+    // and the pipeline uses resource arrays.
+    bool needsTexHeap = cb->activeTextureHeapGpu &&
+        (pl->textureHeapIndex   != NSUIntegerMax ||
+         pl->rwTextureHeapIndex != NSUIntegerMax ||
+         pl->samplerHeapIndex   != NSUIntegerMax);
+
+    if (needsTexHeap)
+    {
+        uint64_t heapGpuAddr = reinterpret_cast<uint64_t>(cb->activeTextureHeapGpu);
+
+        // Find the CPU-accessible allocation that backs the texture heap.
+        MetalAllocation* heapAlloc = nullptr;
+        {
+            std::lock_guard lock(md->allocMutex);
+            heapAlloc = md->findByGpu(heapGpuAddr);
+        }
+
+        if (heapAlloc && heapAlloc->cpuPtr)
+        {
+            size_t offset = (size_t)(heapGpuAddr - heapAlloc->gpuAddr);
+            const auto* descs = reinterpret_cast<const GpuTextureDescriptor*>(
+                static_cast<const uint8_t*>(heapAlloc->cpuPtr) + offset);
+            NSUInteger numDescs = (NSUInteger)((heapAlloc->size - offset) / sizeof(GpuTextureDescriptor));
+
+            // Scan descriptors to find the highest occupied slot for each heap type.
+            NSUInteger maxSampledSlot = 0, maxStorageSlot = 0;
+            for (NSUInteger k = 0; k < numDescs; ++k)
+            {
+                if (!descs[k].data[0]) continue;
+                if (descs[k].data[1] == 0) maxSampledSlot = k + 1;
+                else                       maxStorageSlot = k + 1;
+            }
+
+            // Build and bind the sampled-texture argument buffer.
+            if (pl->textureHeapIndex != NSUIntegerMax && maxSampledSlot > 0)
+            {
+                MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
+                ad.dataType    = MTLDataTypeTexture;
+                ad.textureType = MTLTextureType2D;
+                ad.access      = MTLBindingAccessReadOnly;
+                ad.index       = 0;
+                ad.arrayLength = maxSampledSlot;
+
+                id<MTLArgumentEncoder> argEnc = [md->device newArgumentEncoderWithArguments:@[ad]];
+                id<MTLBuffer> argBuf = [md->device newBufferWithLength:argEnc.encodedLength
+                                                               options:MTLResourceStorageModeShared];
+                [argEnc setArgumentBuffer:argBuf offset:0];
+                for (NSUInteger k = 0; k < maxSampledSlot; ++k)
+                {
+                    if (descs[k].data[0] && descs[k].data[1] == 0)
+                    {
+                        auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
+                        [argEnc setTexture:tex atIndex:k];
+                        [enc useResource:tex usage:MTLResourceUsageRead];
+                    }
+                }
+                [enc setBuffer:argBuf offset:0 atIndex:pl->textureHeapIndex];
+                [enc useResource:argBuf usage:MTLResourceUsageRead];
+            }
+
+            // Build and bind the storage-texture argument buffer.
+            if (pl->rwTextureHeapIndex != NSUIntegerMax && maxStorageSlot > 0)
+            {
+                MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
+                ad.dataType    = MTLDataTypeTexture;
+                ad.textureType = MTLTextureType2D;
+                ad.access      = MTLBindingAccessReadWrite;
+                ad.index       = 0;
+                ad.arrayLength = maxStorageSlot;
+
+                id<MTLArgumentEncoder> argEnc = [md->device newArgumentEncoderWithArguments:@[ad]];
+                id<MTLBuffer> argBuf = [md->device newBufferWithLength:argEnc.encodedLength
+                                                               options:MTLResourceStorageModeShared];
+                [argEnc setArgumentBuffer:argBuf offset:0];
+                for (NSUInteger k = 0; k < maxStorageSlot; ++k)
+                {
+                    if (descs[k].data[0] && descs[k].data[1] == 1)
+                    {
+                        auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
+                        [argEnc setTexture:tex atIndex:k];
+                        [enc useResource:tex usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                    }
+                }
+                [enc setBuffer:argBuf offset:0 atIndex:pl->rwTextureHeapIndex];
+                [enc useResource:argBuf usage:MTLResourceUsageRead];
+            }
+
+            // Bind the pre-built sampler argument buffer.
+            if (pl->samplerHeapIndex != NSUIntegerMax && pl->samplerArgBuf)
+            {
+                [enc setBuffer:pl->samplerArgBuf offset:0 atIndex:pl->samplerHeapIndex];
+                [enc useResource:pl->samplerArgBuf usage:MTLResourceUsageRead];
+            }
+        }
+    }
+
+    // Declare all live GPU allocations so the GPU can access them via device
+    // pointer indirection. (An MTLHeap would be more efficient.)
     {
         std::lock_guard lock(md->allocMutex);
         for (auto& a : md->allocations)
@@ -513,8 +924,7 @@ void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
     [enc useResource:paramBuf usage:MTLResourceUsageRead];
 
     MTLSize grid        = MTLSizeMake(gridDimensions.x, gridDimensions.y, gridDimensions.z);
-    MTLSize threadgroup = MTLSizeMake(cb->currentPipeline->threadgroupSize, 1, 1);
-
+    MTLSize threadgroup = MTLSizeMake(pl->threadgroupSize.x, pl->threadgroupSize.y, pl->threadgroupSize.z);
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
 }
 
@@ -537,7 +947,10 @@ void gpuDispatchIndirect(GpuCommandBuffer cb, void* dataGpu, void* gridDimension
         if (ga)
             [enc dispatchThreadgroupsWithIndirectBuffer:ga->buffer
                                   indirectBufferOffset:(NSUInteger)(gridAddr - ga->gpuAddr)
-                                 threadsPerThreadgroup:MTLSizeMake(cb->currentPipeline->threadgroupSize, 1, 1)];
+                                 threadsPerThreadgroup:MTLSizeMake(
+                                     cb->currentPipeline->threadgroupSize.x,
+                                     cb->currentPipeline->threadgroupSize.y,
+                                     cb->currentPipeline->threadgroupSize.z)];
     }
 }
 
@@ -585,7 +998,7 @@ void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t /*timeout*/)
 void gpuDestroySemaphore(GpuSemaphore sema) { delete sema; }
 
 // ---------------------------------------------------------------------------
-// Commands — blit / barrier
+// Commands — blit / barrier / texture copy
 // ---------------------------------------------------------------------------
 
 void gpuMemCpy(GpuCommandBuffer cb, void* destGpu, void* srcGpu, uint64_t size)
@@ -612,19 +1025,67 @@ void gpuBarrier(GpuCommandBuffer cb, STAGE /*before*/, STAGE /*after*/, HAZARD_F
     // Metal's memory model for buffers on Apple Silicon is coherent within a
     // command buffer; explicit barriers between blit and compute encoders are
     // implied by ending one encoder before starting the next.
-    // Between two compute encoders a memoryBarrierWithScope would be needed —
-    // not required for the spike's linear workloads.
     (void)cb;
 }
 
-void gpuCopyToTexture(GpuCommandBuffer, void*, GpuTexture)
+void gpuCopyToTexture(GpuCommandBuffer cb, void* srcGpu, GpuTexture texture)
 {
-    assert(false && "Metal: gpuCopyToTexture not implemented in spike");
+    auto* md = cb->device->metalDevice;
+    uint64_t srcAddr = reinterpret_cast<uint64_t>(srcGpu);
+
+    MetalAllocation* src = nullptr;
+    {
+        std::lock_guard lock(md->allocMutex);
+        src = md->findByGpu(srcAddr);
+    }
+    if (!src) { NSLog(@"gpuCopyToTexture: src buffer not found"); return; }
+
+    id<MTLTexture> tex     = texture->texture;
+    NSUInteger     w       = tex.width;
+    NSUInteger     h       = tex.height;
+    NSUInteger     bpr     = w * metalBytesPerPixel(tex.pixelFormat);
+    NSUInteger     srcOff  = (NSUInteger)(srcAddr - src->gpuAddr);
+
+    auto enc = cb->blit();
+    [enc copyFromBuffer:src->buffer
+          sourceOffset:srcOff
+     sourceBytesPerRow:bpr
+   sourceBytesPerImage:bpr * h
+            sourceSize:MTLSizeMake(w, h, 1)
+             toTexture:tex
+      destinationSlice:0
+      destinationLevel:0
+     destinationOrigin:MTLOriginMake(0, 0, 0)];
 }
 
-void gpuCopyFromTexture(GpuCommandBuffer, void*, GpuTexture)
+void gpuCopyFromTexture(GpuCommandBuffer cb, void* dstGpu, GpuTexture texture)
 {
-    assert(false && "Metal: gpuCopyFromTexture not implemented in spike");
+    auto* md = cb->device->metalDevice;
+    uint64_t dstAddr = reinterpret_cast<uint64_t>(dstGpu);
+
+    MetalAllocation* dst = nullptr;
+    {
+        std::lock_guard lock(md->allocMutex);
+        dst = md->findByGpu(dstAddr);
+    }
+    if (!dst) { NSLog(@"gpuCopyFromTexture: dst buffer not found"); return; }
+
+    id<MTLTexture> tex    = texture->texture;
+    NSUInteger     w      = tex.width;
+    NSUInteger     h      = tex.height;
+    NSUInteger     bpr    = w * metalBytesPerPixel(tex.pixelFormat);
+    NSUInteger     dstOff = (NSUInteger)(dstAddr - dst->gpuAddr);
+
+    auto enc = cb->blit();
+    [enc copyFromTexture:tex
+            sourceSlice:0
+            sourceLevel:0
+           sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(w, h, 1)
+               toBuffer:dst->buffer
+      destinationOffset:dstOff
+ destinationBytesPerRow:bpr
+destinationBytesPerImage:bpr * h];
 }
 
 void gpuBlitTexture(GpuCommandBuffer, GpuTexture, GpuTexture)

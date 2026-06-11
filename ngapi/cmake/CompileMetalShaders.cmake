@@ -12,7 +12,8 @@
 #   NGAPI_SHADER_INCLUDE_DIR  - include search path passed to slangc (-I)
 #
 # compile_metal_shader(SOURCE <path> STAGE <stage> OUTPUT <rel.metal>
-#                      [ENTRY <name>...] [EXTRA_DEPENDS ...])
+#                      [ENTRY <name>...] [NUMTHREADS "X Y Z"]
+#                      [EXTRA_DEPENDS ...])
 #   SOURCE        - .slang path, absolute or relative to the calling CMakeLists
 #   STAGE         - shader stage (compute, vertex, fragment, ...)
 #   OUTPUT        - output .metal path relative to NGAPI_SHADER_OUTPUT_DIR
@@ -21,6 +22,10 @@
 #                   <OUTPUT_STEM>_<entry>.metal so that every kernel is always
 #                   at [[buffer(0)]] (multi-entry Slang MSL assigns buffer(N)
 #                   by position order).
+#   NUMTHREADS    - optional "X Y Z" threadgroup size embedded as a comment
+#                   "// NGAPI_THREADS X Y Z" at the top of each output file.
+#                   The Metal backend reads this at pipeline creation to set
+#                   the correct dispatchThreadgroups threadsPerThreadgroup.
 #   EXTRA_DEPENDS - additional files that should trigger a recompile
 #
 # Appends produced output paths to NGAPI_METAL_SHADER_OUTPUTS in the caller's scope.
@@ -30,8 +35,15 @@ if(NOT SLANGC)
         HINTS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
 endif()
 
+if(NOT PYTHON3_EXECUTABLE)
+    find_program(PYTHON3_EXECUTABLE python3)
+    if(NOT PYTHON3_EXECUTABLE)
+        message(FATAL_ERROR "python3 not found; required for Metal shader post-processing (RewriteMetalHeaps.py)")
+    endif()
+endif()
+
 function(compile_metal_shader)
-    cmake_parse_arguments(S "" "SOURCE;STAGE;OUTPUT" "ENTRY;EXTRA_DEPENDS" ${ARGN})
+    cmake_parse_arguments(S "" "SOURCE;STAGE;OUTPUT;NUMTHREADS" "ENTRY;EXTRA_DEPENDS" ${ARGN})
 
     if(NOT SLANGC)
         message(FATAL_ERROR "compile_metal_shader: slangc not found; put it on PATH or set VULKAN_SDK")
@@ -69,6 +81,16 @@ function(compile_metal_shader)
 
         get_filename_component(OUT_ABS_DIR "${OUT_FILE}" DIRECTORY)
 
+        # Build the optional numthreads-comment prepend command.
+        set(_PREPEND_CMD "")
+        if(S_NUMTHREADS)
+            set(_PREPEND_CMD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DOUT_FILE=${OUT_FILE}"
+                    "-DCOMMENT=// NGAPI_THREADS ${S_NUMTHREADS}"
+                    -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/PrependMetalComment.cmake")
+        endif()
+
         add_custom_command(
             OUTPUT "${OUT_FILE}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${OUT_ABS_DIR}"
@@ -83,6 +105,12 @@ function(compile_metal_shader)
             # constant memory. Rewrite to `device EntryPointParams_N*` so the
             # pointer chain stays in device address space throughout.
             COMMAND sed -i "" "s/\\(EntryPointParams_[0-9][0-9]*\\) constant\\*/device \\1*/g" "${OUT_FILE}"
+            # Rewrite Tier-2 multi-flexible-array structs and unbounded kernel
+            # parameters so the MSL compiles with newLibraryWithSource: at runtime.
+            COMMAND "${PYTHON3_EXECUTABLE}"
+                "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RewriteMetalHeaps.py"
+                "${OUT_FILE}"
+            ${_PREPEND_CMD}
             DEPENDS "${S_SOURCE}" ${S_EXTRA_DEPENDS}
             COMMENT "Compiling Metal shader ${entry} -> ${OUT_FILE}"
             VERBATIM)
