@@ -386,8 +386,14 @@ struct VulkanInstance
             }
         }
 
+        // Validation is opt-in via NGAPI_VALIDATION (the test harness sets it):
+        // the validation layer wraps every command with a global lock and adds
+        // ~10us per recorded command, which both serializes multithreaded
+        // recording and dominates single-threaded recording time.
+        const bool enableValidation = std::getenv("NGAPI_VALIDATION") != nullptr;
+
         auto instanceRet = instanceBuilder
-                               .request_validation_layers(true)
+                               .request_validation_layers(enableValidation)
                                .require_api_version(VK_API_VERSION_1_4)
                                .enable_extensions(requiredInstanceExtensions)
                                .build();
@@ -429,7 +435,16 @@ struct VulkanDevice
     // recording is lock-free across threads.
     VkCommandPool commandPool = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamily = 0;
-    std::map<std::pair<VkSemaphore, uint64_t>, std::vector<VkCommandPool>> submittedCommandPools;
+    // A retired pool is reset (keeping its driver-side memory warm) and
+    // recycled together with its command buffer instead of being destroyed;
+    // pool churn hammers lock-guarded allocation caches inside drivers.
+    struct RecycledCommandPool
+    {
+        VkCommandPool pool;
+        VkCommandBuffer commandBuffer;
+    };
+    std::map<std::pair<VkSemaphore, uint64_t>, std::vector<RecycledCommandPool>> submittedCommandPools;
+    std::vector<RecycledCommandPool> commandPoolFreeList;
     VkSampler defaultSampler = VK_NULL_HANDLE;
     std::map<VkPipelineBindPoint, VkPipelineLayout> layout;
     VkDescriptorSetLayout textureSetLayout;
@@ -443,6 +458,7 @@ struct VulkanDevice
     std::mutex submitMutex;
     std::shared_mutex allocationsMutex;
     std::mutex samplerMutex;
+    std::mutex poolFreeListMutex;
 
     // Vulkan structs
     VkPhysicalDeviceMemoryProperties memoryProperties = {};
@@ -588,12 +604,17 @@ struct VulkanDevice
 
         for (auto& [key, pools] : submittedCommandPools)
         {
-            for (auto pool : pools)
+            for (auto& recycled : pools)
             {
-                dispatchTable.destroyCommandPool(pool, nullptr);
+                dispatchTable.destroyCommandPool(recycled.pool, nullptr);
             }
         }
         submittedCommandPools.clear();
+        for (auto& recycled : commandPoolFreeList)
+        {
+            dispatchTable.destroyCommandPool(recycled.pool, nullptr);
+        }
+        commandPoolFreeList.clear();
 
         if (patchDescriptorsPipeline != nullptr)
         {
@@ -1884,32 +1905,44 @@ GpuCommandBuffer gpuStartCommandRecording(GpuQueue queue)
 {
     VulkanDevice* vulkanDevice = queue->device->vulkanDevice;
 
-    // One transient pool per command buffer: recording is then lock-free
-    // across threads (pools are externally synchronized, including during
-    // vkCmd* recording). The pool is destroyed when the submission retires.
-    VkCommandPoolCreateInfo poolInfo = {};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = vulkanDevice->graphicsQueueFamily;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    VkCommandPool pool;
-    vulkanDevice->dispatchTable.createCommandPool(&poolInfo, nullptr, &pool);
+    // One pool per command buffer: recording is lock-free across threads
+    // (pools are externally synchronized, including during vkCmd* recording).
+    // Pools are recycled through a free-list when their submission retires —
+    // the reset keeps the driver-side memory warm, and the free-list lock is
+    // taken once per command buffer, never per command.
+    VulkanDevice::RecycledCommandPool recycled = {};
+    {
+        std::lock_guard lock(vulkanDevice->poolFreeListMutex);
+        if (!vulkanDevice->commandPoolFreeList.empty())
+        {
+            recycled = vulkanDevice->commandPoolFreeList.back();
+            vulkanDevice->commandPoolFreeList.pop_back();
+        }
+    }
 
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = pool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
+    if (recycled.pool == VK_NULL_HANDLE)
+    {
+        VkCommandPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.queueFamilyIndex = vulkanDevice->graphicsQueueFamily;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        vulkanDevice->dispatchTable.createCommandPool(&poolInfo, nullptr, &recycled.pool);
 
-    VkCommandBuffer commandBuffer;
-    vulkanDevice->dispatchTable.allocateCommandBuffers(&allocInfo, &commandBuffer);
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = recycled.pool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        vulkanDevice->dispatchTable.allocateCommandBuffers(&allocInfo, &recycled.commandBuffer);
+    }
 
     VkCommandBufferBeginInfo beginInfo = {};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    vulkanDevice->dispatchTable.beginCommandBuffer(commandBuffer, &beginInfo);
+    vulkanDevice->dispatchTable.beginCommandBuffer(recycled.commandBuffer, &beginInfo);
 
-    return new GpuCommandBuffer_T{ commandBuffer, queue->device, pool };
+    return new GpuCommandBuffer_T{ recycled.commandBuffer, queue->device, recycled.pool };
 }
 
 void gpuSubmit(GpuQueue queue, Span<GpuCommandBuffer> commandBuffers, GpuSemaphore semaphore, uint64_t value)
@@ -1935,11 +1968,11 @@ void gpuSubmit(GpuQueue queue, Span<GpuCommandBuffer> commandBuffers, GpuSemapho
     submitInfo.signalSemaphoreCount = 1;
     submitInfo.pSignalSemaphores = &semaphore->semaphore;
 
-    std::vector<VkCommandPool> pools;
+    std::vector<VulkanDevice::RecycledCommandPool> pools;
     pools.reserve(commandBuffers.size());
     for (auto cb : commandBuffers)
     {
-        pools.push_back(cb->pool);
+        pools.push_back({ cb->pool, cb->commandBuffer });
     }
 
     {
@@ -1986,8 +2019,10 @@ void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
     vulkanDevice->dispatchTable.waitSemaphores(&waitInfo, timeout);
 
     // Retire the command pools for this semaphore value and any earlier ones.
-    // Collected under the lock, destroyed outside it.
-    std::vector<VkCommandPool> retired;
+    // Collected under the submit lock, reset outside it, then recycled: the
+    // reset (without releasing resources) keeps the pool's memory warm for
+    // the next gpuStartCommandRecording.
+    std::vector<VulkanDevice::RecycledCommandPool> retired;
     {
         std::lock_guard lock(vulkanDevice->submitMutex);
         for (size_t i = value; i > 0; i--)
@@ -2001,9 +2036,14 @@ void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
             vulkanDevice->submittedCommandPools.erase(it);
         }
     }
-    for (auto pool : retired)
+    if (!retired.empty())
     {
-        vulkanDevice->dispatchTable.destroyCommandPool(pool, nullptr);
+        for (auto& recycled : retired)
+        {
+            vulkanDevice->dispatchTable.resetCommandPool(recycled.pool, 0);
+        }
+        std::lock_guard lock(vulkanDevice->poolFreeListMutex);
+        vulkanDevice->commandPoolFreeList.insert(vulkanDevice->commandPoolFreeList.end(), retired.begin(), retired.end());
     }
 }
 

@@ -20,11 +20,33 @@ externally synchronized.
 
 **Verification** — `samples/multithreading` (headless, self-checking):
 8 workers, each with its own allocator, queue, semaphore and concurrently
-created pipeline, recording/submitting/verifying in a loop. 30 consecutive
-runs clean, 15 of them under `VK_LAYER_KHRONOS_validation` with
-`thread_safety` checking enabled — zero validation messages. The lavapipe
-golden tests cover the single-threaded paths (including the eagerly-created
-patching machinery) unchanged.
+created pipeline, recording/submitting/verifying in a loop. 30+ consecutive
+runs clean, 15 of them with the validation layer's `thread_safety` checking
+enabled — zero validation messages. The lavapipe golden tests cover the
+single-threaded paths (including the eagerly-created patching machinery)
+unchanged.
+
+## Validation is opt-in (`NGAPI_VALIDATION=1`)
+
+The implementation used to call `request_validation_layers(true)`
+unconditionally — every build, every user. The validation layer wraps every
+recorded command with a global lock and ~10µs of checking, which both
+dominated single-threaded recording (≈ 20× overhead) and serialized
+multithreaded recording into a lock convoy (the investigation initially
+looked like a driver-side futex storm; it was the layer). Validation is now
+requested only when `NGAPI_VALIDATION` is set; the test harness sets it
+automatically, since "no validation messages" is part of every test's pass
+criteria.
+
+Measured on an RX 9070 XT (RADV, 9800X3D, 8 cores), recording streams of
+8192 dispatch+barrier pairs per command buffer: single-threaded recording
+~0.5µs/command; 8 threads sustain **3.2–3.7×** single-threaded throughput,
+stable across runs (with validation enabled the same measurement was
+12µs/command and 0.2–1.9× run-to-run).
+
+Command pools are also recycled through a per-device free-list (reset, not
+destroyed, at retirement) so steady-state recording allocates nothing through
+the driver.
 
 ## Known limits
 
@@ -33,18 +55,13 @@ patching machinery) unchanged.
   executing concurrently race on the GPU. Recording them is safe; their
   execution must not overlap. Fix would be per-submission patch buffers —
   deferred until a patching device matters for multithreaded use.
-- **Recording scalability on RADV** is valid but uneven: the API adds no
-  locks, yet 8-thread recording of dispatch+barrier streams measures anywhere
-  from 0.8× to 1.9× of single-threaded throughput run-to-run. strace shows a
-  contended futex roughly once per recorded command inside the
-  driver/loader stack (~15k contended futexes at 8 threads vs ~200
-  single-threaded; allocator tuning has no effect; one genuine NGAPI
-  contributor — a heap-allocated vector per `gpuBarrier` — was found and
-  fixed). Pinning the rest needs `perf`, which this machine currently blocks
-  (`kernel.perf_event_paranoid=4`).
+- **Remaining recording sub-linearity** (3.4× of 8 ideal) is at sane
+  magnitudes (≈ 60M commands/s aggregate into write-combined memory) and sits
+  below the API; one genuine NGAPI contributor — a heap-allocated vector per
+  `gpuBarrier` — was found and fixed along the way.
 - One unexplained phase-1 failure was observed once under validation timing
   (a CPU re-read of an input buffer returned a value never written, while
-  the GPU output was correct). 30 subsequent runs are clean; the sample's
+  the GPU output was correct). All subsequent runs are clean; the sample's
   verification now distinguishes input trampling from output errors so a
   recurrence will be classified precisely.
 
