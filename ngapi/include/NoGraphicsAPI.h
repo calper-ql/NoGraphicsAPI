@@ -9,6 +9,7 @@
 
 #else
 #define alignas(x) // do nothing in shader
+#define NGAPI_ASSERT_GPU_STRUCT(T, expected_size) // C++-side check; no-op in shaders
 
 #define AccelerationStructure uint64_t
 

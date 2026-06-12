@@ -106,28 +106,45 @@ pass `-DSLANGC=/path/to/slangc` to override.
 ## Shared CPU/GPU struct layout rules
 
 Structs passed to shaders via device-buffer pointers must have identical layout
-on the CPU (C++) and GPU (MSL/SPIR-V) sides. One common pitfall:
+on the CPU (C++) and on every GPU target. The two compilers disagree in
+opposite directions, so both rules below are needed:
 
-**Never use `float3` in a device-buffer struct.** Metal MSL gives `float3`
-16-byte alignment inside structs, effectively padding it to 16 bytes, while
-NGAPI's C++ `float3` is 12 bytes. Any field that follows `float3` in the struct
-sits at a different offset on each side, silently corrupting data. Use `float4`
-with `w = 0.0` instead, and access `.rgb` / `.xyz` in the shader.
+1. **Never use `float3` (or `uint3`/`int3`) as a field in a device-buffer
+   struct.** Metal MSL gives 3-component vectors 16-byte alignment inside
+   structs, effectively padding them to 16 bytes, while the C++ `float3` is
+   12 bytes — every field that follows sits at a different offset on each
+   side. Use `float4` with `w = 0.0` and access `.rgb` / `.xyz` in the shader.
+   (Bare `float3*` pointers to tightly packed arrays are fine: the Metal
+   shader toolchain rewrites those to `packed_float3*`.)
 
-Use `NGAPI_ASSERT_GPU_STRUCT` (defined in `NoGraphicsAPI_Impl.h`) to catch
-layout drift at compile time:
+2. **Explicitly pad the struct to a multiple of 16 bytes if it is read as an
+   array.** Slang's SPIR-V "natural" layout packs fields tightly and does NOT
+   round the array stride up to the largest member's alignment:
+   `{ float4; float }` has stride 20 in SPIR-V but 32 in MSL and in C++ with
+   `alignas(16)`. Add explicit `float _pad...;` members so the packed field
+   sum equals the C++ `sizeof` — then all three layouts agree. For the same
+   reason, keep every `float4` field at an offset that is a multiple of 16.
+
+Use `NGAPI_ASSERT_GPU_STRUCT` to pin the agreed size at compile time (defined
+in `NoGraphicsAPI_Impl.h` for C++, a no-op when the header is compiled as
+shader code):
 
 ```cpp
 struct alignas(16) MyData
 {
-    float4 color;   // NOT float3 — see layout rules above
+    float4 color;                // rule 1: NOT float3
     float  value;
+    float  _pad0, _pad1, _pad2;  // rule 2: explicit tail padding to 32
 };
 NGAPI_ASSERT_GPU_STRUCT(MyData, 32);
 ```
 
-The assert fires immediately if the struct size deviates from what the GPU
-expects, making layout bugs a compile error rather than a silent corruption.
+The assert fires immediately if the C++ size deviates from the declared one,
+making layout drift a compile error rather than a silent corruption. The
+compute sample's `Tint` struct (`samples/compute/Compute.h`) is the worked
+example: with `float3 color` it broke Metal (stride 16 vs 32), with an
+unpadded `float4` it broke Vulkan (stride 32 vs 20) — the committed form is
+the one whose stride all targets agree on.
 
 ## Developing NGAPI itself
 

@@ -51,7 +51,10 @@ struct float2
 // buffers. Metal MSL gives float3 16-byte alignment inside structs, padding
 // it to 16 bytes, while this C++ float3 is 12 bytes — sizeof and field offsets
 // diverge, silently corrupting data past the first field. Use float4 with the
-// unused w component set to 0 for any vector field in a device-buffer struct.
+// unused w component set to 0, and pad the struct to a 16-byte multiple with
+// explicit float fields (Slang's SPIR-V layout packs tightly and does not
+// round the array stride up). Full rules: "Shared CPU/GPU struct layout
+// rules" in ngapi/README.md.
 struct float3
 {
     float x, y, z;
@@ -72,15 +75,22 @@ struct float4x4
 // Verify that a struct shared between CPU and a GPU device buffer has the size
 // you expect. Place this immediately after the struct's closing brace.
 //
-//   struct alignas(16) MyData { float4 color; float value; };
+//   struct alignas(16) MyData
+//   {
+//       float4 color;
+//       float  value;
+//       float  _pad0, _pad1, _pad2;  // explicit tail padding to 32
+//   };
 //   NGAPI_ASSERT_GPU_STRUCT(MyData, 32);
 //
 // The assert fires if the size drifts — most commonly because someone replaced
-// a float4 field with float3 (see warning above).
+// a float4 field with float3, or dropped the explicit padding that keeps the
+// SPIR-V array stride equal to sizeof (see warning above and ngapi/README.md).
 #define NGAPI_ASSERT_GPU_STRUCT(T, expected_size)                               \
     static_assert(sizeof(T) == (expected_size),                                 \
         #T ": unexpected size for a GPU device-buffer struct. "                 \
-           "Metal MSL pads float3 to 16 bytes inside structs; use float4.")
+           "Use float4 (not float3) and pad to a 16-byte multiple; see "        \
+           "the layout rules in ngapi/README.md.")
 
 // Use standard library span
 template <typename T>
