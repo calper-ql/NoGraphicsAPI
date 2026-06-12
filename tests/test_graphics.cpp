@@ -112,14 +112,14 @@ int main(int argc, char** argv)
         .colorTargets = Span<ColorTarget>(colorTargets, 2)
     };
 
-    auto vertexIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/graphics/Vertex.spv");
-    auto pixelIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/graphics/Pixel.spv");
+    auto vertexIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/graphics/Vertex" NGAPI_TEST_SHADER_EXT);
+    auto pixelIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/graphics/Pixel" NGAPI_TEST_SHADER_EXT);
     auto pipeline = gpuCreateGraphicsPipeline(device, ByteSpan(vertexIR), ByteSpan(pixelIR), rasterPipeDesc);
 
     GpuDepthStencilDesc depthDescState = { .depthMode = (DEPTH_FLAGS)(DEPTH_READ | DEPTH_WRITE), .depthTest = OP_LESS };
     auto depthState = gpuCreateDepthStencilState(depthDescState);
 
-    auto taaIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/common/TAA.spv");
+    auto taaIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/common/TAA" NGAPI_TEST_SHADER_EXT);
     auto taaPipeline = gpuCreateComputePipeline(device, ByteSpan(taaIR));
 
     std::vector<float3> cubeVertices, cubeNormals;

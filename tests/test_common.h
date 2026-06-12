@@ -7,6 +7,14 @@
 #include <string>
 #include <vector>
 
+// Shader IR file extension for the active backend: SPIR-V on Vulkan, MSL source
+// on Metal. Tests concatenate this onto shader path stems.
+#ifdef GPU_METAL_BACKEND
+#define NGAPI_TEST_SHADER_EXT ".metal"
+#else
+#define NGAPI_TEST_SHADER_EXT ".spv"
+#endif
+
 // Shared helpers for the headless rendering tests. Each test renders a fixed,
 // deterministic sequence of frames into an RGBA8 capture texture, reads it back,
 // and either writes a golden PNG (--generate) or threshold-compares against the

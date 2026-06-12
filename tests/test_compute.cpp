@@ -31,7 +31,7 @@ int main(int argc, char** argv)
     auto semaphore = gpuCreateSemaphore(device, 0);
     LinearAllocator allocator(device);
 
-    auto computeIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/compute/Compute.spv");
+    auto computeIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/compute/Compute" NGAPI_TEST_SHADER_EXT);
     auto pipeline = gpuCreateComputePipeline(device, ByteSpan(computeIR.data(), computeIR.size()));
 
     auto textureHeap = allocator.allocate<GpuTextureDescriptor>(1024);

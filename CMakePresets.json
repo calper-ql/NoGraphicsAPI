@@ -29,7 +29,7 @@
                 "CMAKE_BUILD_TYPE": "Debug",
                 "NGAPI_METAL_BACKEND": "ON",
                 "NGAPI_BUILD_SAMPLES": "ON",
-                "NGAPI_BUILD_TESTS": "OFF"
+                "NGAPI_BUILD_TESTS": "ON"
             }
         },
         {

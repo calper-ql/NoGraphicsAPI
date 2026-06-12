@@ -4,7 +4,9 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 
+#ifndef GPU_METAL_BACKEND
 #include <vulkan/vulkan.h>
+#endif
 
 #include <algorithm>
 #include <cstdlib>
@@ -20,7 +22,15 @@ namespace test
         // (it costs ~10us per recorded command); the tests always want it —
         // validationFailed() is part of every test's pass criteria. parseArgs
         // runs before gpuCreateInstance in every test, so set it here.
-#ifdef _WIN32
+#ifdef GPU_METAL_BACKEND
+        // Metal API validation. Must be set before the first MTLDevice is
+        // created — parseArgs runs before gpuCreateInstance in every test
+        // (same precondition NGAPI_VALIDATION already relies on). Validation
+        // errors abort the process (default error mode), which fails the test
+        // loudly; warnings go to the log.
+        setenv("MTL_DEBUG_LAYER", "1", 1);
+        setenv("MTL_DEBUG_LAYER_WARNING_MODE", "nslog", 1);
+#elif defined(_WIN32)
         _putenv_s("NGAPI_VALIDATION", "1");
 #else
         setenv("NGAPI_VALIDATION", "1", 1);
@@ -84,6 +94,13 @@ namespace test
     }
 
     // ---- validation capture -------------------------------------------------
+#ifdef GPU_METAL_BACKEND
+    // Metal validation is enforced via MTL_DEBUG_LAYER (set in parseArgs);
+    // errors abort the process, so there is nothing to poll here.
+    void beginValidationCapture() {}
+    void endValidationCapture() {}
+    bool validationFailed() { return false; }
+#else
     static bool g_validationFailed = false;
     static VkInstance g_instance = VK_NULL_HANDLE;
     static VkDebugUtilsMessengerEXT g_messenger = VK_NULL_HANDLE;
@@ -140,6 +157,7 @@ namespace test
     {
         return g_validationFailed;
     }
+#endif // GPU_METAL_BACKEND
 
     // ---- golden generation / comparison ------------------------------------
     int finalize(const Args& args, const std::string& name, const Image& actual)
