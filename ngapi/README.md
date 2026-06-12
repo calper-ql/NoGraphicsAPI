@@ -146,6 +146,40 @@ example: with `float3 color` it broke Metal (stride 16 vs 32), with an
 unpadded `float4` it broke Vulkan (stride 32 vs 20) — the committed form is
 the one whose stride all targets agree on.
 
+## Metal backend (macOS)
+
+Configure with `-DNGAPI_METAL_BACKEND=ON` (or the repo's `macos-metal`
+preset) to build the native Metal backend instead of Vulkan. Shaders are
+compiled to MSL with `slangc -target metal`, post-processed by
+`cmake/RewriteMetalHeaps.py` (see `cmake/CompileMetalShaders.cmake`), and
+compiled by the Metal runtime at pipeline creation.
+
+Supported: compute pipelines and dispatch (direct + indirect), bindless
+texture/sampler heaps, inline and static samplers, render passes, graphics
+pipelines, indexed and indirect draws, depth test/write/bias, blend state via
+`GpuRasterDesc`, swapchain presentation (CAMetalLayer), texture upload/
+readback/blit, timeline semaphores, and the multithreaded recording contract.
+Every sample and headless golden-image test runs on it except `raytracing`.
+
+Not supported (asserts loudly rather than misbehaving):
+
+- **Ray tracing** — Slang rejects the bindless
+  `RaytracingAccelerationStructure(uint64)` idiom for `-target metal`, and
+  Metal acceleration structures cannot be placed inside an `MTLBuffer`, so the
+  `gpuMalloc` placement contract needs an API-level decision first. Scoped to
+  a later phase.
+- Multi-draw (`gpuDrawIndexedInstancedIndirectMulti`), meshlet draws, and
+  stencil — nothing in the repo exercises them.
+- `gpuSetBlendState`, `gpuSignalAfter`, `gpuWaitBefore` are no-ops, matching
+  the Vulkan reference where they are also TODO.
+
+Behavioral notes: sampler LOD bias is ignored (Metal samplers have none);
+sampler-heap slot 0 is the device default sampler on both backends; the
+rendered image orientation matches Vulkan exactly (the backend uses a
+negative-height viewport internally). The friction log at the top of
+`src/NoGraphicsAPI_Metal.mm` documents every Vulkan/Metal divergence in
+detail.
+
 ## Developing NGAPI itself
 
 `src/PatchDescriptorsSpv.h` is generated from `shaders/PatchDescriptors.slang`

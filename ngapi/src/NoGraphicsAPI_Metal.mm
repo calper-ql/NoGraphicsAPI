@@ -1,7 +1,13 @@
 // Metal backend — covers gpuCreateDevice, gpuMalloc, gpuDispatch, textures,
-// samplers, argument buffers, surface/swapchain (CAMetalLayer), and blit.
-// Runs the headless compute samples (multiplegpus, learning) and the windowed
-// compute sample (CAMetalLayer → ngapi::createWindow via window_metal.mm).
+// samplers, argument buffers, render passes, graphics pipelines, indexed and
+// indirect draws, depth test/bias, surface/swapchain (CAMetalLayer), and blit.
+// Runs every sample and headless test except raytracing (acceleration
+// structures are unimplemented — see the assert in gpuCreateAccelerationStructure;
+// Slang also rejects the bindless RaytracingAccelerationStructure(uint64)
+// idiom for -target metal, so the port needs an API-level decision first).
+// Multi-draw, meshlet draws and stencil are unimplemented and assert;
+// gpuSetBlendState / gpuSignalAfter / gpuWaitBefore are no-ops to match the
+// Vulkan reference, which also TODOs them.
 //
 // Friction log (things that diverge from the Vulkan backend):
 //
@@ -58,6 +64,47 @@
 //      in Metal output. The build system embeds "// NGAPI_THREADS X Y Z" at the
 //      top of each .metal file; gpuCreateComputePipeline reads it and stores the
 //      size in GpuPipeline_T. Defaults to {64,1,1} when the comment is absent.
+//
+//   9. Render passes are a third encoder type. The render encoder is created
+//      only by gpuBeginRenderPass (creating it lazily would silently split the
+//      user's pass), and blit()/compute() assert while a pass is live. Because
+//      the API order is gpuSetPipeline → gpuBeginRenderPass, graphics pipeline
+//      state is recorded at gpuSetPipeline and bound lazily at the first draw.
+//
+//  10. Y axis: Vulkan NDC is +y-down, Metal +y-up. Render passes use a
+//      negative-height viewport {0, H, W, -H} which restores Vulkan's mapping
+//      (NDC (-1,-1) → pixel (0,0)). Front-facedness is evaluated after the
+//      viewport transform on both APIs, so the flip also makes the Vulkan
+//      winding/cull enums carry over 1:1 — no winding swap, and the rendered
+//      image matches the Vulkan goldens orientation-exactly. The scissor rect
+//      is framebuffer-space and is never flipped.
+//
+//  11. Draw-time entry params: render entry points share one EntryPointParams
+//      struct of TWO 8-byte device pointers {vertexData, pixelData}; each draw
+//      binds a single 16-byte buffer at [[buffer(0)]] of BOTH stages (vertex
+//      and fragment buffer indices are independent namespaces). The vertex
+//      stage only has that binding because the build-time rewriter injects it:
+//      slangc 2026.8 silently drops entry-point uniform params for -stage
+//      vertex (see RewriteMetalHeaps.py).
+//
+//  12. Residency: draws replicate gpuDispatch's contract — argument buffers
+//      for the texture/sampler heaps plus a useResource loop over all live
+//      allocations, with render-stage variants. Declaring residency on a
+//      texture that is an attachment of the live pass is validation-clean
+//      (verified empirically); actually SAMPLING an attachment of the current
+//      pass remains a feedback loop and is unsupported. The samples only read
+//      pass outputs from the TAA dispatch after gpuEndRenderPass.
+//
+//  13. Known mismatch: the CAMetalLayer pixel format is BGRA8Unorm while
+//      gpuSwapchainDesc reports FORMAT_BGRA8_SRGB. Harmless while the drawable
+//      is blit-only (no render pipeline targets it); framebufferOnly stays NO
+//      for the compute-shader blit. Resolve before ever creating a PSO from
+//      the swapchain format.
+//
+//  14. The recording path is not lock-free: gpuDispatch and draws take the
+//      device allocation mutex (and allocate per-call MTLBuffers), unlike the
+//      Vulkan backend's lock-free recording. The multithreading sample's
+//      phase-2 scaling numbers reflect that.
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
@@ -2103,7 +2150,11 @@ GpuAccelerationStructure gpuCreateAccelerationStructure(GpuDevice, GpuAccelerati
     return nullptr;
 }
 
-void gpuBuildAccelerationStructures(GpuCommandBuffer, Span<GpuAccelerationStructure>, void*, MODE) {}
+void gpuBuildAccelerationStructures(GpuCommandBuffer, Span<GpuAccelerationStructure>, void*, MODE)
+{
+    // Loud like its sibling stubs — a silent no-op here renders black with no error.
+    assert(false && "Metal: acceleration structures not implemented");
+}
 
 void gpuDestroyAccelerationStructure(GpuAccelerationStructure as) { delete as; }
 

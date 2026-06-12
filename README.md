@@ -52,6 +52,12 @@ cd build/bin && ./raytracing
 
 To use the SDL3 windowing backend instead of GLFW, configure with `cmake --preset linux-sdl3` (builds into `build/sdl3/`), or pass `-DNGAPI_WINDOW_BACKEND=SDL3`.
 
+On macOS, `cmake --preset macos-metal` (builds into `build/metal/`) selects the
+native Metal backend instead of Vulkan — no MoltenVK or Vulkan SDK needed at
+runtime; shaders compile to MSL via `slangc -target metal`. Every sample and
+headless test except `raytracing` runs on it; see "Metal backend (macOS)" in
+[`ngapi/README.md`](ngapi/README.md) for the supported surface.
+
 ## Windowless Usage
 ### Common header
 ```c++
