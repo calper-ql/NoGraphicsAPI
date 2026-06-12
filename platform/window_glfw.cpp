@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 
 namespace ngapi
 {
@@ -14,6 +15,11 @@ namespace ngapi
         GLFWwindow* handle = nullptr;
         std::array<bool, static_cast<size_t>(Key::Count)> down{};
         std::array<bool, static_cast<size_t>(Key::Count)> pressed{};
+
+        // NGAPI_MAX_FRAMES env var: request close after N pollEvents calls
+        // (headless/CI runs of the windowed samples). -1 = no cap.
+        long maxFrames  = -1;
+        long frameCount = 0;
     };
 
     static int toGlfwKey(Key key)
@@ -53,6 +59,10 @@ namespace ngapi
 
         Window* window = new Window();
         window->handle = glfwCreateWindow(width, height, title, nullptr, nullptr);
+        if (const char* s = getenv("NGAPI_MAX_FRAMES"))
+        {
+            window->maxFrames = atol(s);
+        }
         return window;
     }
 
@@ -94,6 +104,11 @@ namespace ngapi
             bool now = glfwGetKey(window->handle, toGlfwKey(static_cast<Key>(i))) == GLFW_PRESS;
             window->pressed[i] = now && !window->down[i];
             window->down[i] = now;
+        }
+
+        if (window->maxFrames >= 0 && ++window->frameCount >= window->maxFrames)
+        {
+            glfwSetWindowShouldClose(window->handle, GLFW_TRUE);
         }
     }
 

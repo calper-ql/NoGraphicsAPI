@@ -147,6 +147,14 @@ compile_metal_shader(SOURCE samples/compute/Compute.slang STAGE compute
     NUMTHREADS "16 16 1"
     EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/compute/Compute.h")
 
+compile_metal_shader(SOURCE samples/graphics/Vertex.slang STAGE vertex
+    OUTPUT graphics/Vertex.metal
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/graphics/Graphics.h")
+
+compile_metal_shader(SOURCE samples/graphics/Pixel.slang STAGE fragment
+    OUTPUT graphics/Pixel.metal
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/graphics/Graphics.h")
+
 compile_metal_shader(SOURCE samples/common/TAA.slang STAGE compute
     OUTPUT common/TAA.metal
     NUMTHREADS "16 16 1"
@@ -301,6 +309,13 @@ target_compile_definitions(compute PRIVATE GPU_METAL_BACKEND)
 target_link_libraries(compute PRIVATE
     ngapi::ngapi ngapi-platform-metal ngapi-samples-common stb glm::glm)
 add_dependencies(compute metal_shaders copy_assets_metal)
+
+# Windowed graphics sample (rasterization + TAA). GPU_METAL_BACKEND comes in
+# as a PUBLIC compile definition on ngapi::ngapi.
+add_executable(graphics samples/graphics/Graphics.cpp)
+target_link_libraries(graphics PRIVATE
+    ngapi::ngapi ngapi-platform-metal ngapi-samples-common stb glm::glm)
+add_dependencies(graphics metal_shaders copy_assets_metal)
 
 # Headless multithreading demo/self-test (run from build/bin). GPU_METAL_BACKEND
 # comes in as a PUBLIC compile definition on ngapi::ngapi.

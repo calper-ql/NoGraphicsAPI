@@ -12,6 +12,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // Close delegate
@@ -76,6 +77,11 @@ namespace ngapi
         bool                 closeRequested = false;
         std::array<bool, static_cast<size_t>(Key::Count)> down{};
         std::array<bool, static_cast<size_t>(Key::Count)> pressed{};
+
+        // NGAPI_MAX_FRAMES env var: request close after N pollEvents calls
+        // (headless/CI runs of the windowed samples). -1 = no cap.
+        long maxFrames  = -1;
+        long frameCount = 0;
     };
 
     static Key keyFromCode(uint16_t code)
@@ -133,6 +139,8 @@ namespace ngapi
         w->layer        = layer;
         w->delegate     = [[NgapiWindowDelegate alloc] initWithFlag:&w->closeRequested];
         [nsw setDelegate:w->delegate];
+        if (const char* s = getenv("NGAPI_MAX_FRAMES"))
+            w->maxFrames = atol(s);
         return w;
     }
 
@@ -181,6 +189,9 @@ namespace ngapi
             }
             [NSApp sendEvent:event];
         }
+
+        if (window->maxFrames >= 0 && ++window->frameCount >= window->maxFrames)
+            window->closeRequested = true;
     }
 
     bool shouldClose(Window* window)

@@ -145,8 +145,15 @@ struct GpuSwapchain_T
     uint32_t          framesInFlight;
 };
 
+enum PipelineKind
+{
+    PIPELINE_COMPUTE,
+    PIPELINE_GRAPHICS
+};
+
 struct GpuPipeline_T
 {
+    PipelineKind                kind = PIPELINE_COMPUTE;
     id<MTLComputePipelineState> pso;
     id<MTLFunction>             fn;               // retained for argument encoder creation
     GpuDevice                   device;
@@ -164,11 +171,48 @@ struct GpuPipeline_T
     // which dangle if the MTLSamplerStates are released.
     id<MTLBuffer> samplerArgBuf = nil;
     std::vector<id<MTLSamplerState>> samplers;
+
+    // ---- graphics (PIPELINE_GRAPHICS only) --------------------------------
+    id<MTLRenderPipelineState> renderPso = nil;
+    MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;   // used at draw time
+    MTLCullMode      cullMode      = MTLCullModeNone;            // from GpuRasterDesc.cull
+    MTLWinding       frontWinding  = MTLWindingCounterClockwise; // 1:1 with Vulkan (flipped viewport)
+
+    // Per-stage buffer indices discovered via MTLRenderPipelineReflection.
+    // Vertex and fragment buffer indices are independent namespaces.
+    NSUInteger vsEntryParamsIndex   = 0;
+    NSUInteger fsEntryParamsIndex   = 0;
+    NSUInteger vsTextureHeapIndex   = NSUIntegerMax;
+    NSUInteger vsRwTextureHeapIndex = NSUIntegerMax;
+    NSUInteger vsSamplerHeapIndex   = NSUIntegerMax;
+    NSUInteger fsTextureHeapIndex   = NSUIntegerMax;
+    NSUInteger fsRwTextureHeapIndex = NSUIntegerMax;
+    NSUInteger fsSamplerHeapIndex   = NSUIntegerMax;
+
+    // Per-stage sampler argument buffers. Vertex and fragment come from
+    // SEPARATE MSL files with independently numbered sampler slots, so each
+    // stage gets its own buffer (and owns its sampler objects, see above).
+    id<MTLBuffer> vsSamplerArgBuf = nil;
+    id<MTLBuffer> fsSamplerArgBuf = nil;
+    std::vector<id<MTLSamplerState>> vsSamplers;
+    std::vector<id<MTLSamplerState>> fsSamplers;
 };
 
 struct GpuQueue_T             { id<MTLCommandQueue>         queue; GpuDevice device; };
 struct GpuSemaphore_T         { id<MTLSharedEvent>          event; GpuDevice device; };
-struct GpuDepthStencilState_T { GpuDepthStencilDesc desc; };
+
+// The MTLDepthStencilState is immutable and derived purely from the immutable
+// desc captured at gpuCreateDepthStencilState, so the state object IS the
+// cache: one entry, created lazily on first gpuSetDepthStencilState. The
+// once_flag guards concurrent first use from two recording threads (the
+// multithreading contract); everything after creation is immutable.
+struct GpuDepthStencilState_T
+{
+    GpuDepthStencilDesc      desc;
+    std::once_flag           once;
+    id<MTLDepthStencilState> mtl       = nil;
+    id<MTLDevice>            mtlDevice = nil;  // creation device; asserted equal on reuse
+};
 struct GpuBlendState_T        { GpuBlendDesc desc; };
 #ifdef GPU_RAY_TRACING_EXTENSION
 struct GpuAccelerationStructure_T { void* placeholder; };
@@ -179,12 +223,23 @@ struct GpuCommandBuffer_T
     id<MTLCommandBuffer>          cb;
     id<MTLBlitCommandEncoder>     blitEnc    = nil;
     id<MTLComputeCommandEncoder>  computeEnc = nil;
+    id<MTLRenderCommandEncoder>   renderEnc  = nil; // created ONLY by gpuBeginRenderPass
     GpuPipeline currentPipeline = nullptr;
     GpuDevice   device;
     void*       activeTextureHeapGpu = nullptr; // set by gpuSetActiveTextureHeapPtr
 
+    // Graphics pipeline state (PSO + cull + winding) is recorded at
+    // gpuSetPipeline and bound lazily at the first draw: the API order is
+    // setPipeline -> beginRenderPass, but Metal needs the render encoder to
+    // exist before any state can be set on it.
+    bool graphicsStateBound = false;
+
+    // The render encoder is never created lazily (it needs the pass
+    // descriptor), so blit()/compute() assert rather than auto-end it —
+    // ending a render pass implicitly would silently split the user's pass.
     id<MTLBlitCommandEncoder> blit()
     {
+        assert(!renderEnc && "Metal: blit inside a render pass is invalid");
         if (computeEnc) { [computeEnc endEncoding]; computeEnc = nil; }
         if (!blitEnc)    blitEnc = [cb blitCommandEncoder];
         return blitEnc;
@@ -192,15 +247,17 @@ struct GpuCommandBuffer_T
 
     id<MTLComputeCommandEncoder> compute()
     {
+        assert(!renderEnc && "Metal: dispatch inside a render pass is invalid");
         if (blitEnc)    { [blitEnc endEncoding];    blitEnc    = nil; }
         if (!computeEnc) computeEnc = [cb computeCommandEncoder];
         return computeEnc;
     }
 
-    void endAll()
+    void endAll() // render encoder is normally already ended by gpuEndRenderPass
     {
         if (blitEnc)    { [blitEnc endEncoding];    blitEnc    = nil; }
         if (computeEnc) { [computeEnc endEncoding]; computeEnc = nil; }
+        if (renderEnc)  { [renderEnc endEncoding];  renderEnc  = nil; }
     }
 };
 
@@ -419,7 +476,91 @@ static MTLTextureUsage metalTextureUsage(USAGE_FLAGS flags)
     if (flags & USAGE_STORAGE)                  usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     if (flags & USAGE_COLOR_ATTACHMENT)         usage |= MTLTextureUsageRenderTarget;
     if (flags & USAGE_DEPTH_STENCIL_ATTACHMENT) usage |= MTLTextureUsageRenderTarget;
+    // gpuBlitTexture is a COMPUTE kernel on Metal (not a blit-encoder copy):
+    // it reads src via access::read and writes dst via access::read_write, so
+    // TRANSFER usage needs the shader-access bits. (Assumes TRANSFER_DST
+    // formats are shader-writable — true for everything the repo blits.)
+    if (flags & USAGE_TRANSFER_SRC)             usage |= MTLTextureUsageShaderRead;
+    if (flags & USAGE_TRANSFER_DST)             usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     return usage;
+}
+
+// ---------------------------------------------------------------------------
+// Graphics-pipeline mapping helpers
+// ---------------------------------------------------------------------------
+
+static MTLBlendOperation metalBlendOp(BLEND op)
+{
+    switch (op)
+    {
+    case BLEND_ADD:          return MTLBlendOperationAdd;
+    case BLEND_SUBTRACT:     return MTLBlendOperationSubtract;
+    case BLEND_REV_SUBTRACT: return MTLBlendOperationReverseSubtract;
+    case BLEND_MIN:          return MTLBlendOperationMin;
+    case BLEND_MAX:          return MTLBlendOperationMax;
+    }
+    return MTLBlendOperationAdd;
+}
+
+static MTLBlendFactor metalBlendFactor(FACTOR f)
+{
+    switch (f)
+    {
+    case FACTOR_ZERO:      return MTLBlendFactorZero;
+    case FACTOR_ONE:       return MTLBlendFactorOne;
+    case FACTOR_SRC_COLOR: return MTLBlendFactorSourceColor;
+    case FACTOR_DST_COLOR: return MTLBlendFactorDestinationColor;
+    case FACTOR_SRC_ALPHA: return MTLBlendFactorSourceAlpha;
+    }
+    return MTLBlendFactorOne;
+}
+
+static MTLColorWriteMask metalWriteMask(uint8_t m)
+{
+    MTLColorWriteMask mask = MTLColorWriteMaskNone;
+    if (m & 0x1) mask |= MTLColorWriteMaskRed;
+    if (m & 0x2) mask |= MTLColorWriteMaskGreen;
+    if (m & 0x4) mask |= MTLColorWriteMaskBlue;
+    if (m & 0x8) mask |= MTLColorWriteMaskAlpha;
+    return mask;
+}
+
+// OP (NoGraphicsAPI_Impl.h, 0-based) -> MTLCompareFunction for the DEPTH test.
+// NOT the same encoding as the sampler compare table (metalCompareFunction
+// below, which is the 1-based COMPARE_* sampler encoding) — do not reuse it.
+static MTLCompareFunction metalCompareFromOp(OP op)
+{
+    switch (op)
+    {
+    case OP_NEVER:         return MTLCompareFunctionNever;
+    case OP_LESS:          return MTLCompareFunctionLess;
+    case OP_EQUAL:         return MTLCompareFunctionEqual;
+    case OP_LESS_EQUAL:    return MTLCompareFunctionLessEqual;
+    case OP_GREATER:       return MTLCompareFunctionGreater;
+    case OP_NOT_EQUAL:     return MTLCompareFunctionNotEqual;
+    case OP_GREATER_EQUAL: return MTLCompareFunctionGreaterEqual;
+    case OP_ALWAYS:        return MTLCompareFunctionAlways;
+    default: assert(false && "OP_KEEP/OP_ZERO are stencil ops"); return MTLCompareFunctionAlways;
+    }
+}
+
+// Vulkan maps NDC y-down to framebuffer y-down with a positive-height
+// viewport; Metal NDC y is up. A negative-height MTLViewport
+// {0, H, W, -H, 0, 1} reproduces Vulkan's mapping exactly (verified
+// empirically: NDC(-1,-1) -> pixel(0,0), validation-clean), and because Metal
+// evaluates facedness in framebuffer space the Vulkan winding enum carries
+// over 1:1 with no swap. Depth needs no z remap (Metal NDC z is already [0,1]).
+static constexpr bool kFlipViewportY = true;
+
+static void applyViewportScissor(id<MTLRenderCommandEncoder> enc, NSUInteger w, NSUInteger h)
+{
+    MTLViewport vp;
+    if (kFlipViewportY)
+        vp = { 0.0, (double)h, (double)w, -(double)h, 0.0, 1.0 };
+    else
+        vp = { 0.0, 0.0,       (double)w,  (double)h, 0.0, 1.0 };
+    [enc setViewport:vp];
+    [enc setScissorRect:(MTLScissorRect){0, 0, w, h}]; // framebuffer coords; never flipped
 }
 
 static NSUInteger metalBytesPerPixel(MTLPixelFormat fmt)
@@ -725,6 +866,44 @@ static std::string findEntryName(const std::string& src, const char* attr, const
     return fallback;
 }
 
+// Build a Tier-2 sampler argument buffer holding `samplers` at indices [0, n).
+// Used by both compute and render pipelines (one buffer per stage).
+static id<MTLBuffer> buildSamplerArgBuf(MetalDevice* md,
+                                        const std::vector<id<MTLSamplerState>>& samplers)
+{
+    MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
+    ad.dataType    = MTLDataTypeSampler;
+    ad.index       = 0;
+    ad.arrayLength = samplers.size();
+
+    id<MTLArgumentEncoder> enc = [md->device newArgumentEncoderWithArguments:@[ad]];
+    id<MTLBuffer> argBuf = [md->device newBufferWithLength:enc.encodedLength
+                                                   options:MTLResourceStorageModeShared];
+    [enc setArgumentBuffer:argBuf offset:0];
+    for (NSUInteger i = 0; i < (NSUInteger)samplers.size(); ++i)
+        [enc setSamplerState:samplers[i] atIndex:i];
+    return argBuf;
+}
+
+// Discover the buffer indices of the entry-point params and the bindless
+// heaps from one stage's reflection bindings. The same name prefixes appear
+// in compute (refl.bindings) and render (refl.vertexBindings /
+// refl.fragmentBindings) reflection. Order matters: "rwTextureHeap" is
+// prefix-tested BEFORE "textureHeap".
+static void discoverHeapBindings(NSArray<id<MTLBinding>>* bindings,
+                                 NSUInteger* params, NSUInteger* tex,
+                                 NSUInteger* rwTex, NSUInteger* samp)
+{
+    for (id<MTLBinding> b in bindings)
+    {
+        if (b.type != MTLBindingTypeBuffer) continue;
+        if ([b.name hasPrefix:@"rwTextureHeap"])         *rwTex  = b.index;
+        else if ([b.name hasPrefix:@"textureHeap"])      *tex    = b.index;
+        else if ([b.name hasPrefix:@"ngapiSamplerHeap"]) *samp   = b.index;
+        else if ([b.name hasPrefix:@"entryPointParams"]) *params = b.index;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Textures
 // ---------------------------------------------------------------------------
@@ -742,6 +921,8 @@ GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* /*ptrGp
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType      = metalTextureType(desc.type);
     td.pixelFormat      = metalPixelFormat(desc.format);
+    assert(td.pixelFormat != MTLPixelFormatInvalid &&
+           "gpuCreateTexture: format has no Metal equivalent");
     td.width            = desc.dimensions.x;
     td.height           = (desc.type == TEXTURE_1D) ? 1 : desc.dimensions.y;
     td.depth            = (desc.type == TEXTURE_3D) ? desc.dimensions.z : 1;
@@ -917,35 +1098,15 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     NSUInteger texHeapIdx     = NSUIntegerMax;
     NSUInteger rwTexHeapIdx   = NSUIntegerMax;
     NSUInteger samplerHeapIdx = NSUIntegerMax;
-    for (id<MTLBinding> b in refl.bindings)
-    {
-        if (b.type != MTLBindingTypeBuffer) continue;
-        if ([b.name hasPrefix:@"rwTextureHeap"])          rwTexHeapIdx   = b.index;
-        else if ([b.name hasPrefix:@"textureHeap"])        texHeapIdx     = b.index;
-        else if ([b.name hasPrefix:@"ngapiSamplerHeap"])   samplerHeapIdx = b.index;
-        else if ([b.name hasPrefix:@"entryPointParams"])   paramsIndex    = b.index;
-    }
+    discoverHeapBindings(refl.bindings, &paramsIndex, &texHeapIdx, &rwTexHeapIdx, &samplerHeapIdx);
 
     // Pre-build sampler argument buffer (stays constant for this pipeline).
     // The samplers vector is never empty on the MSL source path (slot 0 is the
     // default sampler), so any kernel that binds ngapiSamplerHeap gets a real
     // heap — including ones with zero patched literals that read slot 0 raw.
     id<MTLBuffer> samplerArgBuf = nil;
-    const auto& samplers = samplerScan.samplers;
-    if (!samplers.empty() && samplerHeapIdx != NSUIntegerMax)
-    {
-        MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
-        ad.dataType    = MTLDataTypeSampler;
-        ad.index       = 0;
-        ad.arrayLength = samplers.size();
-
-        id<MTLArgumentEncoder> enc = [md->device newArgumentEncoderWithArguments:@[ad]];
-        samplerArgBuf = [md->device newBufferWithLength:enc.encodedLength
-                                               options:MTLResourceStorageModeShared];
-        [enc setArgumentBuffer:samplerArgBuf offset:0];
-        for (NSUInteger i = 0; i < (NSUInteger)samplers.size(); ++i)
-            [enc setSamplerState:samplers[i] atIndex:i];
-    }
+    if (!samplerScan.samplers.empty() && samplerHeapIdx != NSUIntegerMax)
+        samplerArgBuf = buildSamplerArgBuf(md, samplerScan.samplers);
 
     auto* p              = new GpuPipeline_T{};
     p->pso               = pso;
@@ -961,15 +1122,183 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     return p;
 }
 
-GpuPipeline gpuCreateGraphicsPipeline(GpuDevice, ByteSpan, ByteSpan, GpuRasterDesc)
+// Compile one render-stage MSL source and produce its (specialized) function:
+// patch sampler literals, scan for the attributed entry name, and — when the
+// source declares [[function_constant(...)]] (STATIC_SAMPLER slots) — create
+// the function via newFunctionWithName:constantValues:error:. Building any
+// pipeline state from a plain-fetched function out of a library that declares
+// function constants aborts the process (see friction log 6), so the
+// constantValues path is mandatory. Returns nil on failure (logged).
+static id<MTLFunction> createRenderStageFunction(MetalDevice* md, ByteSpan ir,
+                                                 const char* attr, // "[[vertex]]" / "[[fragment]]"
+                                                 SamplerScanResult& scan)
 {
-    assert(false && "Metal: graphics pipeline not implemented in spike");
-    return nullptr;
+    std::string src(reinterpret_cast<const char*>(ir.data()), ir.size());
+    std::string patched = patchSamplerLiterals(src, md->device, scan);
+
+    NSError* err = nil;
+    NSString* msl = [NSString stringWithUTF8String:patched.c_str()];
+    MTLCompileOptions* opts = [MTLCompileOptions new];
+    opts.languageVersion = MTLLanguageVersion3_1;
+    id<MTLLibrary> lib = [md->device newLibraryWithSource:msl options:opts error:&err];
+    if (!lib)
+    {
+        NSLog(@"gpuCreateGraphicsPipeline: %s library error: %@", attr, err);
+        return nil;
+    }
+
+    // The source is the only reliable name authority: slangc renames entries
+    // ('main' -> main_0/main_1) and render libraries contain non-entry helpers
+    // with entry-like names, so never fall back to a hardcoded mapping here.
+    std::string scanned = findEntryName(patched, attr, nullptr);
+    if (scanned.empty())
+    {
+        NSLog(@"gpuCreateGraphicsPipeline: no %s function in MSL source", attr);
+        return nil;
+    }
+    NSString* entryName = [NSString stringWithUTF8String:scanned.c_str()];
+
+    id<MTLFunction> fn = nil;
+    if (patched.find("[[function_constant(") != std::string::npos)
+    {
+        MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+        for (const auto& fc : scan.functionConstants)
+        {
+            uint64_t value = fc.second;
+            [cv setConstantValue:&value type:MTLDataTypeULong atIndex:fc.first];
+        }
+        fn = [lib newFunctionWithName:entryName constantValues:cv error:&err];
+    }
+    else
+    {
+        fn = [lib newFunctionWithName:entryName];
+    }
+    if (!fn)
+        NSLog(@"gpuCreateGraphicsPipeline: %s entry '%@' not found or specialization failed: %@",
+              attr, entryName, err);
+    return fn;
+}
+
+GpuPipeline gpuCreateGraphicsPipeline(GpuDevice device, ByteSpan vertexIR, ByteSpan pixelIR,
+                                      GpuRasterDesc desc)
+{
+    auto* md = device->metalDevice;
+
+    auto isMetallib = [](const ByteSpan& ir) {
+        return ir.size() >= 4
+            && ir[0] == 0x4D && ir[1] == 0x54 && ir[2] == 0x4C && ir[3] == 0x42;
+    };
+    assert(!isMetallib(vertexIR) && !isMetallib(pixelIR) &&
+           "Metal: graphics pipelines support runtime MSL only (no .metallib yet)");
+
+    // Per-stage source handling. Vertex and fragment are separate MSL files
+    // with independent sampler slot numbering, so each stage gets its own
+    // sampler scan (and later its own argument buffer).
+    SamplerScanResult vsScan, fsScan;
+    id<MTLFunction> vertexFn = createRenderStageFunction(md, vertexIR, "[[vertex]]", vsScan);
+    if (!vertexFn) return nullptr;
+    id<MTLFunction> fragmentFn = createRenderStageFunction(md, pixelIR, "[[fragment]]", fsScan);
+    if (!fragmentFn) return nullptr;
+
+    MTLRenderPipelineDescriptor* rd = [MTLRenderPipelineDescriptor new];
+    rd.vertexFunction   = vertexFn;
+    rd.fragmentFunction = fragmentFn;
+
+    // Color targets + blend. Vulkan semantics: ONE GpuBlendDesc applies to ALL
+    // targets when desc.blendState != nullptr; otherwise blending is disabled
+    // and only the per-target ColorTarget.writeMask applies.
+    for (uint32_t i = 0; i < desc.colorTargets.size(); ++i)
+    {
+        const ColorTarget& t = desc.colorTargets[i];
+        MTLRenderPipelineColorAttachmentDescriptor* ca = rd.colorAttachments[i];
+        ca.pixelFormat = metalPixelFormat(t.format);
+        assert(ca.pixelFormat != MTLPixelFormatInvalid &&
+               "gpuCreateGraphicsPipeline: color target format has no Metal equivalent");
+        if (desc.blendState)
+        {
+            const GpuBlendDesc& b = *desc.blendState;
+            ca.blendingEnabled             = YES;
+            ca.rgbBlendOperation           = metalBlendOp(b.colorOp);
+            ca.alphaBlendOperation         = metalBlendOp(b.alphaOp);
+            ca.sourceRGBBlendFactor        = metalBlendFactor(b.srcColorFactor);
+            ca.destinationRGBBlendFactor   = metalBlendFactor(b.dstColorFactor);
+            ca.sourceAlphaBlendFactor      = metalBlendFactor(b.srcAlphaFactor);
+            ca.destinationAlphaBlendFactor = metalBlendFactor(b.dstAlphaFactor);
+            ca.writeMask                   = metalWriteMask(b.colorWriteMask);
+        }
+        else
+        {
+            ca.blendingEnabled = NO;
+            ca.writeMask       = metalWriteMask(t.writeMask);
+        }
+    }
+
+    if (desc.depthFormat != FORMAT_NONE)
+    {
+        rd.depthAttachmentPixelFormat = metalPixelFormat(desc.depthFormat);
+        assert(rd.depthAttachmentPixelFormat != MTLPixelFormatInvalid &&
+               "gpuCreateGraphicsPipeline: depth format has no Metal equivalent");
+    }
+    assert(desc.stencilFormat == FORMAT_NONE &&
+           "Metal: stencil attachments not implemented (nothing uses them)");
+
+    rd.rasterSampleCount      = desc.sampleCount;
+    rd.alphaToCoverageEnabled = desc.alphaToCoverage ? YES : NO;
+
+    NSError* err = nil;
+    MTLRenderPipelineReflection* refl = nil;
+    id<MTLRenderPipelineState> rpso =
+        [md->device newRenderPipelineStateWithDescriptor:rd
+                                                 options:MTLPipelineOptionBindingInfo
+                                              reflection:&refl
+                                                   error:&err];
+    if (!rpso)
+    {
+        NSLog(@"gpuCreateGraphicsPipeline: pipeline error: %@", err);
+        return nullptr;
+    }
+
+    auto* p      = new GpuPipeline_T{};
+    p->kind      = PIPELINE_GRAPHICS;
+    p->device    = device;
+    p->renderPso = rpso;
+
+    // Per-stage binding discovery — same prefix-match logic as compute, run
+    // once per stage on the render reflection arrays.
+    discoverHeapBindings(refl.vertexBindings,   &p->vsEntryParamsIndex, &p->vsTextureHeapIndex,
+                         &p->vsRwTextureHeapIndex, &p->vsSamplerHeapIndex);
+    discoverHeapBindings(refl.fragmentBindings, &p->fsEntryParamsIndex, &p->fsTextureHeapIndex,
+                         &p->fsRwTextureHeapIndex, &p->fsSamplerHeapIndex);
+
+    // Topology. TOPOLOGY_TRIANGLE_FAN has no MTLPrimitiveType — assert, don't mis-map.
+    switch (desc.topology)
+    {
+    case TOPOLOGY_TRIANGLE_LIST:  p->primitiveType = MTLPrimitiveTypeTriangle;      break;
+    case TOPOLOGY_TRIANGLE_STRIP: p->primitiveType = MTLPrimitiveTypeTriangleStrip; break;
+    default: assert(false && "Metal: TOPOLOGY_TRIANGLE_FAN unsupported");           break;
+    }
+
+    // CULL quirk — replicate Vulkan EXACTLY: anything but CULL_NONE culls BACK
+    // faces; the cull value only picks the front-face winding. With the
+    // flipped viewport (kFlipViewportY) the winding enum maps 1:1.
+    p->cullMode     = desc.cull != CULL_NONE ? MTLCullModeBack : MTLCullModeNone;
+    p->frontWinding = desc.cull == CULL_CW ? MTLWindingClockwise : MTLWindingCounterClockwise;
+
+    // Per-stage sampler argument buffers (always built when the stage binds
+    // the sampler heap — the samplers vector is never empty, slot 0 default).
+    if (p->vsSamplerHeapIndex != NSUIntegerMax && !vsScan.samplers.empty())
+        p->vsSamplerArgBuf = buildSamplerArgBuf(md, vsScan.samplers);
+    if (p->fsSamplerHeapIndex != NSUIntegerMax && !fsScan.samplers.empty())
+        p->fsSamplerArgBuf = buildSamplerArgBuf(md, fsScan.samplers);
+    p->vsSamplers = std::move(vsScan.samplers);
+    p->fsSamplers = std::move(fsScan.samplers);
+
+    return p;
 }
 
 GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuDevice, ByteSpan, ByteSpan, GpuRasterDesc)
 {
-    assert(false && "Metal: meshlet pipeline not implemented in spike");
+    assert(false && "Metal: meshlet pipelines not implemented (no sample or test exercises them)");
     return nullptr;
 }
 
@@ -1020,8 +1349,17 @@ GpuCommandBuffer gpuStartCommandRecording(GpuQueue queue)
 void gpuSetPipeline(GpuCommandBuffer cb, GpuPipeline pipeline)
 {
     cb->currentPipeline = pipeline;
-    auto enc = cb->compute();
-    [enc setComputePipelineState:pipeline->pso];
+    if (pipeline->kind == PIPELINE_COMPUTE)
+    {
+        auto enc = cb->compute();
+        [enc setComputePipelineState:pipeline->pso];
+    }
+    else
+    {
+        // Record-only. The API order is setPipeline -> beginRenderPass, so the
+        // graphics state is bound lazily at the first draw inside the pass.
+        cb->graphicsStateBound = false;
+    }
 }
 
 void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
@@ -1041,6 +1379,112 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
 // For textured compute shaders, we also build Tier-2 argument buffers for
 // textureHeap[], rwTextureHeap[], and ngapiSamplerHeap[] and bind them at
 // the buffer indices discovered via reflection at pipeline creation.
+
+// Tier-2 texture argument buffers built from the descriptor heap at heapGpu,
+// plus the textures that must be declared resident alongside them. Shared by
+// gpuDispatch (compute encoder) and the draw path (render encoder) — only the
+// bind/useResource calls differ per encoder type.
+struct HeapArgBufs
+{
+    bool heapResolved = false;               // heapGpu found in a CPU-visible allocation
+    id<MTLBuffer> tex = nil;                 // sampled-texture arg buffer (or nil)
+    id<MTLBuffer> rw  = nil;                 // storage-texture arg buffer (or nil)
+    std::vector<id<MTLTexture>> texResident; // need useResource(Read)
+    std::vector<id<MTLTexture>> rwResident;  // need useResource(Read|Write)
+};
+
+static HeapArgBufs buildHeapArgBuffers(MetalDevice* md, void* heapGpu, bool wantTex, bool wantRw)
+{
+    HeapArgBufs out;
+    uint64_t heapGpuAddr = reinterpret_cast<uint64_t>(heapGpu);
+
+    // Find the CPU-accessible allocation that backs the texture heap.
+    MetalAllocation* heapAlloc = nullptr;
+    {
+        std::lock_guard lock(md->allocMutex);
+        heapAlloc = md->findByGpu(heapGpuAddr);
+    }
+    if (!heapAlloc || !heapAlloc->cpuPtr)
+        return out;
+    out.heapResolved = true;
+
+    size_t offset = (size_t)(heapGpuAddr - heapAlloc->gpuAddr);
+    const auto* descs = reinterpret_cast<const GpuTextureDescriptor*>(
+        static_cast<const uint8_t*>(heapAlloc->cpuPtr) + offset);
+    NSUInteger numDescs = (NSUInteger)((heapAlloc->size - offset) / sizeof(GpuTextureDescriptor));
+
+    // The lock guards the texture registry; the heap may be a suballocation
+    // of a larger gpuMalloc page whose tail holds unrelated user data, so a
+    // slot only counts as occupied when data[0] is a live gpuCreateTexture
+    // texture.
+    std::lock_guard lock(md->allocMutex);
+    auto occupied = [&](NSUInteger k) {
+        return descs[k].data[0] && md->isLiveTexture((const void*)descs[k].data[0]);
+    };
+
+    // Scan descriptors to find the highest occupied slot for each heap type.
+    NSUInteger maxSampledSlot = 0, maxStorageSlot = 0;
+    for (NSUInteger k = 0; k < numDescs; ++k)
+    {
+        if (!occupied(k)) continue;
+        if (descs[k].data[1] == 0) maxSampledSlot = k + 1;
+        else                       maxStorageSlot = k + 1;
+    }
+
+    // Build the sampled-texture argument buffer.
+    if (wantTex && maxSampledSlot > 0)
+    {
+        MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
+        ad.dataType    = MTLDataTypeTexture;
+        ad.textureType = MTLTextureType2D;
+        ad.access      = MTLBindingAccessReadOnly;
+        ad.index       = 0;
+        ad.arrayLength = maxSampledSlot;
+
+        id<MTLArgumentEncoder> argEnc = [md->device newArgumentEncoderWithArguments:@[ad]];
+        id<MTLBuffer> argBuf = [md->device newBufferWithLength:argEnc.encodedLength
+                                                       options:MTLResourceStorageModeShared];
+        [argEnc setArgumentBuffer:argBuf offset:0];
+        for (NSUInteger k = 0; k < maxSampledSlot; ++k)
+        {
+            if (occupied(k) && descs[k].data[1] == 0)
+            {
+                auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
+                [argEnc setTexture:tex atIndex:k];
+                out.texResident.push_back(tex);
+            }
+        }
+        out.tex = argBuf;
+    }
+
+    // Build the storage-texture argument buffer.
+    if (wantRw && maxStorageSlot > 0)
+    {
+        MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
+        ad.dataType    = MTLDataTypeTexture;
+        ad.textureType = MTLTextureType2D;
+        ad.access      = MTLBindingAccessReadWrite;
+        ad.index       = 0;
+        ad.arrayLength = maxStorageSlot;
+
+        id<MTLArgumentEncoder> argEnc = [md->device newArgumentEncoderWithArguments:@[ad]];
+        id<MTLBuffer> argBuf = [md->device newBufferWithLength:argEnc.encodedLength
+                                                       options:MTLResourceStorageModeShared];
+        [argEnc setArgumentBuffer:argBuf offset:0];
+        for (NSUInteger k = 0; k < maxStorageSlot; ++k)
+        {
+            if (occupied(k) && descs[k].data[1] == 1)
+            {
+                auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
+                [argEnc setTexture:tex atIndex:k];
+                out.rwResident.push_back(tex);
+            }
+        }
+        out.rw = argBuf;
+    }
+
+    return out;
+}
 
 void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
 {
@@ -1064,100 +1508,29 @@ void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
 
     if (needsTexHeap)
     {
-        uint64_t heapGpuAddr = reinterpret_cast<uint64_t>(cb->activeTextureHeapGpu);
-
-        // Find the CPU-accessible allocation that backs the texture heap.
-        MetalAllocation* heapAlloc = nullptr;
+        HeapArgBufs h = buildHeapArgBuffers(md, cb->activeTextureHeapGpu,
+                                            pl->textureHeapIndex   != NSUIntegerMax,
+                                            pl->rwTextureHeapIndex != NSUIntegerMax);
+        if (h.tex)
         {
-            std::lock_guard lock(md->allocMutex);
-            heapAlloc = md->findByGpu(heapGpuAddr);
+            for (id<MTLTexture> t : h.texResident)
+                [enc useResource:t usage:MTLResourceUsageRead];
+            [enc setBuffer:h.tex offset:0 atIndex:pl->textureHeapIndex];
+            [enc useResource:h.tex usage:MTLResourceUsageRead];
+        }
+        if (h.rw)
+        {
+            for (id<MTLTexture> t : h.rwResident)
+                [enc useResource:t usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+            [enc setBuffer:h.rw offset:0 atIndex:pl->rwTextureHeapIndex];
+            [enc useResource:h.rw usage:MTLResourceUsageRead];
         }
 
-        if (heapAlloc && heapAlloc->cpuPtr)
+        // Bind the pre-built sampler argument buffer.
+        if (h.heapResolved && pl->samplerHeapIndex != NSUIntegerMax && pl->samplerArgBuf)
         {
-            size_t offset = (size_t)(heapGpuAddr - heapAlloc->gpuAddr);
-            const auto* descs = reinterpret_cast<const GpuTextureDescriptor*>(
-                static_cast<const uint8_t*>(heapAlloc->cpuPtr) + offset);
-            NSUInteger numDescs = (NSUInteger)((heapAlloc->size - offset) / sizeof(GpuTextureDescriptor));
-
-            // The lock guards the texture registry; the heap may be a
-            // suballocation of a larger gpuMalloc page whose tail holds
-            // unrelated user data, so a slot only counts as occupied when
-            // data[0] is a live gpuCreateTexture texture.
-            std::lock_guard lock(md->allocMutex);
-            auto occupied = [&](NSUInteger k) {
-                return descs[k].data[0] && md->isLiveTexture((const void*)descs[k].data[0]);
-            };
-
-            // Scan descriptors to find the highest occupied slot for each heap type.
-            NSUInteger maxSampledSlot = 0, maxStorageSlot = 0;
-            for (NSUInteger k = 0; k < numDescs; ++k)
-            {
-                if (!occupied(k)) continue;
-                if (descs[k].data[1] == 0) maxSampledSlot = k + 1;
-                else                       maxStorageSlot = k + 1;
-            }
-
-            // Build and bind the sampled-texture argument buffer.
-            if (pl->textureHeapIndex != NSUIntegerMax && maxSampledSlot > 0)
-            {
-                MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
-                ad.dataType    = MTLDataTypeTexture;
-                ad.textureType = MTLTextureType2D;
-                ad.access      = MTLBindingAccessReadOnly;
-                ad.index       = 0;
-                ad.arrayLength = maxSampledSlot;
-
-                id<MTLArgumentEncoder> argEnc = [md->device newArgumentEncoderWithArguments:@[ad]];
-                id<MTLBuffer> argBuf = [md->device newBufferWithLength:argEnc.encodedLength
-                                                               options:MTLResourceStorageModeShared];
-                [argEnc setArgumentBuffer:argBuf offset:0];
-                for (NSUInteger k = 0; k < maxSampledSlot; ++k)
-                {
-                    if (occupied(k) && descs[k].data[1] == 0)
-                    {
-                        auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
-                        [argEnc setTexture:tex atIndex:k];
-                        [enc useResource:tex usage:MTLResourceUsageRead];
-                    }
-                }
-                [enc setBuffer:argBuf offset:0 atIndex:pl->textureHeapIndex];
-                [enc useResource:argBuf usage:MTLResourceUsageRead];
-            }
-
-            // Build and bind the storage-texture argument buffer.
-            if (pl->rwTextureHeapIndex != NSUIntegerMax && maxStorageSlot > 0)
-            {
-                MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
-                ad.dataType    = MTLDataTypeTexture;
-                ad.textureType = MTLTextureType2D;
-                ad.access      = MTLBindingAccessReadWrite;
-                ad.index       = 0;
-                ad.arrayLength = maxStorageSlot;
-
-                id<MTLArgumentEncoder> argEnc = [md->device newArgumentEncoderWithArguments:@[ad]];
-                id<MTLBuffer> argBuf = [md->device newBufferWithLength:argEnc.encodedLength
-                                                               options:MTLResourceStorageModeShared];
-                [argEnc setArgumentBuffer:argBuf offset:0];
-                for (NSUInteger k = 0; k < maxStorageSlot; ++k)
-                {
-                    if (occupied(k) && descs[k].data[1] == 1)
-                    {
-                        auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
-                        [argEnc setTexture:tex atIndex:k];
-                        [enc useResource:tex usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-                    }
-                }
-                [enc setBuffer:argBuf offset:0 atIndex:pl->rwTextureHeapIndex];
-                [enc useResource:argBuf usage:MTLResourceUsageRead];
-            }
-
-            // Bind the pre-built sampler argument buffer.
-            if (pl->samplerHeapIndex != NSUIntegerMax && pl->samplerArgBuf)
-            {
-                [enc setBuffer:pl->samplerArgBuf offset:0 atIndex:pl->samplerHeapIndex];
-                [enc useResource:pl->samplerArgBuf usage:MTLResourceUsageRead];
-            }
+            [enc setBuffer:pl->samplerArgBuf offset:0 atIndex:pl->samplerHeapIndex];
+            [enc useResource:pl->samplerArgBuf usage:MTLResourceUsageRead];
         }
     }
 
@@ -1384,49 +1757,263 @@ void gpuBlitTexture(GpuCommandBuffer cb, GpuTexture dst, GpuTexture src)
         threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 }
 
-void gpuSetDepthStencilState(GpuCommandBuffer, GpuDepthStencilState) {}
-void gpuSetBlendState(GpuCommandBuffer, GpuBlendState)               {}
+// Call-site contract (matches the Vulkan backend + samples): called INSIDE
+// the render pass, after gpuBeginRenderPass. Applies directly to the live
+// render encoder.
+void gpuSetDepthStencilState(GpuCommandBuffer cb, GpuDepthStencilState state)
+{
+    assert(cb->renderEnc && "gpuSetDepthStencilState must be called inside a render pass");
+    const GpuDepthStencilDesc& d = state->desc;
 
-void gpuSignalAfter(GpuCommandBuffer, STAGE, void*, uint64_t, SIGNAL)   {}
-void gpuWaitBefore(GpuCommandBuffer, STAGE, void*, uint64_t, OP, HAZARD_FLAGS, uint64_t) {}
+    // Stencil: nothing in the repo uses it; fail loudly rather than mis-render.
+    assert(d.stencilFront.test == OP_ALWAYS && d.stencilBack.test == OP_ALWAYS &&
+           "Metal: stencil not implemented");
+
+    std::call_once(state->once, [&] {
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        bool read  = d.depthMode & DEPTH_READ;
+        bool write = d.depthMode & DEPTH_WRITE;
+        // Vulkan semantics: with depthTestEnable=FALSE neither test NOR write
+        // occur (cmdSetDepthTestEnable gates both). Replicate: no READ ->
+        // compare Always, write disabled even if DEPTH_WRITE is set.
+        dd.depthCompareFunction = read ? metalCompareFromOp(d.depthTest) : MTLCompareFunctionAlways;
+        dd.depthWriteEnabled    = (read && write) ? YES : NO;
+        state->mtl       = [cb->device->metalDevice->device newDepthStencilStateWithDescriptor:dd];
+        state->mtlDevice = cb->device->metalDevice->device;
+    });
+    assert(state->mtlDevice == cb->device->metalDevice->device &&
+           "Metal: depth-stencil state reused across devices");
+
+    [cb->renderEnc setDepthStencilState:state->mtl];
+
+    // Depth bias is encoder state on Metal (not part of MTLDepthStencilState) —
+    // mirrors Vulkan's dynamic vkCmdSetDepthBias.
+    if (d.depthBias != 0.0f || d.depthBiasSlopeFactor != 0.0f)
+        [cb->renderEnc setDepthBias:d.depthBias slopeScale:d.depthBiasSlopeFactor clamp:d.depthBiasClamp];
+    else
+        [cb->renderEnc setDepthBias:0 slopeScale:0 clamp:0];
+}
+
+// Match the Vulkan reference, where these are also TODO no-ops; nothing in
+// the repo calls them.
+void gpuSetBlendState(GpuCommandBuffer, GpuBlendState) {} // TODO: implement (TODO in Vulkan too)
+
+void gpuSignalAfter(GpuCommandBuffer, STAGE, void*, uint64_t, SIGNAL)   {} // TODO: implement (TODO in Vulkan too)
+void gpuWaitBefore(GpuCommandBuffer, STAGE, void*, uint64_t, OP, HAZARD_FLAGS, uint64_t) {} // TODO: implement (TODO in Vulkan too)
 
 // ---------------------------------------------------------------------------
-// Render pass / draw stubs
+// Render pass / draws
 // ---------------------------------------------------------------------------
 
-void gpuBeginRenderPass(GpuCommandBuffer, GpuRenderPassDesc)
+// Vulkan reference semantics replicated exactly: color loadOp from desc.loadOp
+// with clear {0,0,0,1}; depth loadOp ALWAYS clear to 1.0 regardless of
+// desc.loadOp; all stores Store; viewport+scissor from colorTargets[0]
+// dimensions; no stencil attachment.
+void gpuBeginRenderPass(GpuCommandBuffer cb, GpuRenderPassDesc desc)
 {
-    assert(false && "Metal: render pass not implemented in spike");
+    assert(!cb->renderEnc && "Metal: nested render pass");
+    cb->endAll(); // end any blit/compute encoder (Vulkan has no such split; we must)
+
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    for (uint32_t i = 0; i < desc.colorTargets.size(); ++i)
+    {
+        GpuTexture t = desc.colorTargets[i];
+        rp.colorAttachments[i].texture     = t->texture;
+        rp.colorAttachments[i].loadAction  = desc.loadOp == LOAD_OP_LOAD ? MTLLoadActionLoad
+                                                                         : MTLLoadActionClear;
+        rp.colorAttachments[i].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+        rp.colorAttachments[i].storeAction = MTLStoreActionStore;
+    }
+    if (desc.depthStencilTarget)
+    {
+        rp.depthAttachment.texture     = desc.depthStencilTarget->texture;
+        rp.depthAttachment.loadAction  = MTLLoadActionClear; // Vulkan ref ALWAYS clears depth
+        rp.depthAttachment.clearDepth  = 1.0;
+        rp.depthAttachment.storeAction = MTLStoreActionStore;
+    }
+
+    cb->renderEnc = [cb->cb renderCommandEncoderWithDescriptor:rp];
+    cb->graphicsStateBound = false;
+
+    assert(desc.colorTargets.size() > 0 && "Metal: render pass needs colorTargets[0] for viewport/scissor");
+    GpuTexture ct0 = desc.colorTargets[0];
+    applyViewportScissor(cb->renderEnc, ct0->texture.width, ct0->texture.height);
 }
 
-void gpuEndRenderPass(GpuCommandBuffer)
+void gpuEndRenderPass(GpuCommandBuffer cb)
 {
-    assert(false && "Metal: render pass not implemented in spike");
+    assert(cb->renderEnc && "Metal: gpuEndRenderPass without a live render pass");
+    [cb->renderEnc endEncoding];
+    cb->renderEnc = nil;
+    cb->graphicsStateBound = false;
 }
 
-void gpuDrawIndexedInstanced(GpuCommandBuffer, void*, void*, void*, uint32_t, uint32_t)
+// Shared draw prologue: lazily bind the graphics pipeline state, bind the
+// per-draw EntryPointParams buffer to both stages, bind the heap argument
+// buffers, and declare residency. Live render-pass attachments are NOT
+// special-cased: declaring residency for an attachment of the current pass is
+// validation-clean (verified empirically); actually SAMPLING one would be a
+// feedback loop and remains unsupported (nothing in the repo does it).
+static void bindDrawState(GpuCommandBuffer cb, void* vertexDataGpu, void* pixelDataGpu)
 {
-    assert(false && "Metal: draw not implemented in spike");
+    auto* md = cb->device->metalDevice;
+    assert(cb->renderEnc && "Metal: draw outside a render pass");
+    GpuPipeline pl = cb->currentPipeline;
+    assert(pl && pl->kind == PIPELINE_GRAPHICS && "Metal: draw without a graphics pipeline");
+    auto enc = cb->renderEnc;
+
+    if (!cb->graphicsStateBound)
+    {
+        [enc setRenderPipelineState:pl->renderPso];
+        [enc setCullMode:pl->cullMode];
+        [enc setFrontFacingWinding:pl->frontWinding];
+        cb->graphicsStateBound = true;
+    }
+
+    // Per-draw EntryPointParams: both render stages share
+    // `struct EntryPointParams { VertexData device* ; PixelData device* ; }` —
+    // ONE 16-byte two-pointer buffer bound at the params index of BOTH stages
+    // (vertex and fragment buffer indices are independent namespaces).
+    uint64_t params[2] = { reinterpret_cast<uint64_t>(vertexDataGpu),
+                           reinterpret_cast<uint64_t>(pixelDataGpu) };
+    id<MTLBuffer> paramBuf = [md->device newBufferWithBytes:params
+                                                     length:sizeof(params)
+                                                    options:MTLResourceStorageModeShared];
+    [enc setVertexBuffer:paramBuf offset:0 atIndex:pl->vsEntryParamsIndex];
+    [enc setFragmentBuffer:paramBuf offset:0 atIndex:pl->fsEntryParamsIndex];
+    [enc useResource:paramBuf usage:MTLResourceUsageRead
+              stages:MTLRenderStageVertex | MTLRenderStageFragment];
+
+    bool wantTex  = pl->vsTextureHeapIndex   != NSUIntegerMax || pl->fsTextureHeapIndex   != NSUIntegerMax;
+    bool wantRw   = pl->vsRwTextureHeapIndex != NSUIntegerMax || pl->fsRwTextureHeapIndex != NSUIntegerMax;
+    bool wantSamp = pl->vsSamplerHeapIndex   != NSUIntegerMax || pl->fsSamplerHeapIndex   != NSUIntegerMax;
+
+    if (cb->activeTextureHeapGpu && (wantTex || wantRw || wantSamp))
+    {
+        HeapArgBufs h = buildHeapArgBuffers(md, cb->activeTextureHeapGpu, wantTex, wantRw);
+        if (h.tex)
+        {
+            if (pl->vsTextureHeapIndex != NSUIntegerMax)
+                [enc setVertexBuffer:h.tex offset:0 atIndex:pl->vsTextureHeapIndex];
+            if (pl->fsTextureHeapIndex != NSUIntegerMax)
+                [enc setFragmentBuffer:h.tex offset:0 atIndex:pl->fsTextureHeapIndex];
+            [enc useResource:h.tex usage:MTLResourceUsageRead
+                      stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            for (id<MTLTexture> t : h.texResident)
+                [enc useResource:t usage:MTLResourceUsageRead
+                          stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        }
+        if (h.rw)
+        {
+            if (pl->vsRwTextureHeapIndex != NSUIntegerMax)
+                [enc setVertexBuffer:h.rw offset:0 atIndex:pl->vsRwTextureHeapIndex];
+            if (pl->fsRwTextureHeapIndex != NSUIntegerMax)
+                [enc setFragmentBuffer:h.rw offset:0 atIndex:pl->fsRwTextureHeapIndex];
+            [enc useResource:h.rw usage:MTLResourceUsageRead
+                      stages:MTLRenderStageVertex | MTLRenderStageFragment];
+            for (id<MTLTexture> t : h.rwResident)
+                [enc useResource:t usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                          stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        }
+        if (pl->vsSamplerArgBuf && pl->vsSamplerHeapIndex != NSUIntegerMax)
+        {
+            [enc setVertexBuffer:pl->vsSamplerArgBuf offset:0 atIndex:pl->vsSamplerHeapIndex];
+            [enc useResource:pl->vsSamplerArgBuf usage:MTLResourceUsageRead
+                      stages:MTLRenderStageVertex];
+        }
+        if (pl->fsSamplerArgBuf && pl->fsSamplerHeapIndex != NSUIntegerMax)
+        {
+            [enc setFragmentBuffer:pl->fsSamplerArgBuf offset:0 atIndex:pl->fsSamplerHeapIndex];
+            [enc useResource:pl->fsSamplerArgBuf usage:MTLResourceUsageRead
+                      stages:MTLRenderStageFragment];
+        }
+    }
+
+    // Declare all live GPU allocations (vertex/uv/instance/index buffers, the
+    // VertexData/PixelData structs, the heap buffer itself) so the shaders can
+    // chase device pointers — the render-stage variant of gpuDispatch's loop.
+    {
+        std::lock_guard lock(md->allocMutex);
+        for (auto& a : md->allocations)
+            [enc useResource:a.buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite
+                      stages:MTLRenderStageVertex | MTLRenderStageFragment];
+    }
 }
 
-void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer, void*, void*, void*, void*)
+void gpuDrawIndexedInstanced(GpuCommandBuffer cb, void* vertexDataGpu, void* pixelDataGpu,
+                             void* indicesGpu, uint32_t indexCount, uint32_t instanceCount)
 {
-    assert(false && "Metal: draw not implemented in spike");
+    auto* md = cb->device->metalDevice;
+    bindDrawState(cb, vertexDataGpu, pixelDataGpu);
+    auto enc = cb->renderEnc;
+    auto pl  = cb->currentPipeline;
+
+    // Index VA -> (MTLBuffer, offset) via the allocation registry — the Metal
+    // equivalent of the Vulkan backend's findAllocation.
+    uint64_t indexAddr = reinterpret_cast<uint64_t>(indicesGpu);
+    MetalAllocation* ia = nullptr;
+    {
+        std::lock_guard lock(md->allocMutex);
+        ia = md->findByGpu(indexAddr);
+    }
+    assert(ia && "gpuDrawIndexedInstanced: index buffer not found");
+
+    // Vulkan ref: VK_INDEX_TYPE_UINT32 with firstIndex=0, vertexOffset=0,
+    // firstInstance=0 — the base 6-argument variant is exact.
+    [enc drawIndexedPrimitives:pl->primitiveType
+                    indexCount:indexCount
+                     indexType:MTLIndexTypeUInt32
+                   indexBuffer:ia->buffer
+             indexBufferOffset:(NSUInteger)(indexAddr - ia->gpuAddr)
+                 instanceCount:instanceCount];
+}
+
+void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer cb, void* vertexDataGpu, void* pixelDataGpu,
+                                     void* indicesGpu, void* argsGpu)
+{
+    auto* md = cb->device->metalDevice;
+    bindDrawState(cb, vertexDataGpu, pixelDataGpu);
+    auto enc = cb->renderEnc;
+    auto pl  = cb->currentPipeline;
+
+    uint64_t indexAddr = reinterpret_cast<uint64_t>(indicesGpu);
+    uint64_t argsAddr  = reinterpret_cast<uint64_t>(argsGpu);
+    MetalAllocation* ia = nullptr;
+    MetalAllocation* aa = nullptr;
+    {
+        std::lock_guard lock(md->allocMutex);
+        ia = md->findByGpu(indexAddr);
+        aa = md->findByGpu(argsAddr);
+    }
+    assert(ia && "gpuDrawIndexedInstancedIndirect: index buffer not found");
+    assert(aa && "gpuDrawIndexedInstancedIndirect: args buffer not found");
+
+    // MTLDrawIndexedPrimitivesIndirectArguments {indexCount, instanceCount,
+    // indexStart, baseVertex, baseInstance} is field-for-field identical to
+    // VkDrawIndexedIndirectCommand and GpuIndirectDrawArgs, so the user's args
+    // buffer is consumed as-is (residency covered by the all-allocations loop;
+    // 4-byte offset alignment guaranteed by gpuMalloc).
+    [enc drawIndexedPrimitives:pl->primitiveType
+                     indexType:MTLIndexTypeUInt32
+                   indexBuffer:ia->buffer
+             indexBufferOffset:(NSUInteger)(indexAddr - ia->gpuAddr)
+                indirectBuffer:aa->buffer
+          indirectBufferOffset:(NSUInteger)(argsAddr - aa->gpuAddr)];
 }
 
 void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer, void*, uint32_t, void*, uint32_t, void*, void*, void*)
 {
-    assert(false && "Metal: draw not implemented in spike");
+    assert(false && "Metal: multi-draw not implemented (no sample or test exercises it)");
 }
 
 void gpuDrawMeshlets(GpuCommandBuffer, void*, void*, uint3)
 {
-    assert(false && "Metal: draw not implemented in spike");
+    assert(false && "Metal: meshlet draws not implemented (no sample or test exercises them)");
 }
 
 void gpuDrawMeshletsIndirect(GpuCommandBuffer, void*, void*, void*)
 {
-    assert(false && "Metal: draw not implemented in spike");
+    assert(false && "Metal: meshlet draws not implemented (no sample or test exercises them)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,6 +2058,17 @@ GpuTextureDesc gpuSwapchainDesc(GpuSwapchain swapchain)
 GpuTexture gpuSwapchainImage(GpuSwapchain swapchain)
 {
     id<CAMetalDrawable> drawable = [swapchain->layer nextDrawable];
+    if (!drawable)
+    {
+        // nextDrawable can return nil (1s timeout, e.g. window fully occluded).
+        // Keep the previous frame's texture so the caller never dereferences a
+        // nil-texture wrapper; this frame's present becomes a no-op.
+        NSLog(@"gpuSwapchainImage: nextDrawable returned nil; reusing the previous drawable texture");
+        assert(swapchain->swapchainTex.texture &&
+               "gpuSwapchainImage: no drawable available on the first acquire");
+        swapchain->currentDrawable = nil;
+        return &swapchain->swapchainTex;
+    }
     swapchain->currentDrawable   = drawable;
     swapchain->swapchainTex.texture = drawable.texture;
     return &swapchain->swapchainTex;
