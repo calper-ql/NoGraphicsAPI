@@ -73,7 +73,11 @@ int main(int argc, char** argv)
     LinearAllocator mainAllocator(device);
     auto mainQueue = gpuCreateQueue(device);
 
+#ifdef GPU_METAL_BACKEND
+    auto ir = loadIR("shaders/multithreading/Multithreading.metal");
+#else
     auto ir = loadIR("shaders/multithreading/Multithreading.spv");
+#endif
 
     GpuTextureDesc whiteDesc{
         .type = TEXTURE_2D,

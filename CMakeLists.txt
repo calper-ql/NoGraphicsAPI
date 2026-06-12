@@ -147,6 +147,25 @@ compile_metal_shader(SOURCE samples/compute/Compute.slang STAGE compute
     NUMTHREADS "16 16 1"
     EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/compute/Compute.h")
 
+compile_metal_shader(SOURCE samples/common/TAA.slang STAGE compute
+    OUTPUT common/TAA.metal
+    NUMTHREADS "16 16 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/common/TAA.h")
+
+compile_metal_shader(SOURCE samples/multithreading/Multithreading.slang STAGE compute
+    OUTPUT multithreading/Multithreading.metal
+    NUMTHREADS "64 1 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/multithreading/Multithreading.h")
+
+# All five bench entry points from one .slang; multi-entry compilation emits
+# one file per entry (SamplerBench_<entry>.metal) so every kernel keeps
+# EntryPointParams at [[buffer(0)]].
+compile_metal_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute
+    OUTPUT samplerbench/SamplerBench.metal
+    ENTRY benchHardware benchStatic benchInline benchStaticNearest benchManualNearest
+    NUMTHREADS "16 16 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+
 add_custom_target(metal_shaders ALL DEPENDS ${NGAPI_METAL_SHADER_OUTPUTS})
 endif() # NGAPI_METAL_BACKEND
 
@@ -282,6 +301,17 @@ target_compile_definitions(compute PRIVATE GPU_METAL_BACKEND)
 target_link_libraries(compute PRIVATE
     ngapi::ngapi ngapi-platform-metal ngapi-samples-common stb glm::glm)
 add_dependencies(compute metal_shaders copy_assets_metal)
+
+# Headless multithreading demo/self-test (run from build/bin). GPU_METAL_BACKEND
+# comes in as a PUBLIC compile definition on ngapi::ngapi.
+add_executable(multithreading samples/multithreading/Multithreading.cpp)
+target_link_libraries(multithreading PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(multithreading metal_shaders)
+
+# Scratch sampler regression benchmark (run from build/bin).
+add_executable(samplerbench samples/samplerbench/SamplerBench.cpp)
+target_link_libraries(samplerbench PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(samplerbench metal_shaders)
 endif() # NGAPI_METAL_BACKEND
 
 endif() # NGA_BUILD_SAMPLES

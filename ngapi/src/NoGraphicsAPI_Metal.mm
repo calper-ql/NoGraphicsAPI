@@ -33,11 +33,20 @@
 //      the MTLBuffer's GPU address cast to void* (same convention as the Vulkan
 //      backend's MEMORY_GPU path, which returns the VkDeviceAddress).
 //
-//   6. Inline samplers: Slang emits `ngapiSamplerHeap[0x4Exxxxxx]` where the
-//      magic value encodes sampler state. We scan the MSL source at pipeline
-//      creation, decode each unique magic value into an MTLSamplerState, assign
-//      compact slot indices (0, 1, 2, …), patch the source, and bind a sampler
-//      argument buffer at dispatch time.
+//   6. Samplers: Slang carries INLINE_SAMPLER state in tagged 32-bit literals
+//      (`ngapiSamplerHeap[0x4Exxxxxx]`) and STATIC_SAMPLER state in the default
+//      of a 64-bit function constant (0x4E47 in the top 16 bits). We scan the
+//      MSL source at pipeline creation, decode each unique state into an
+//      MTLSamplerState, assign compact slot indices starting at 1 (slot 0 is
+//      the device default sampler, matching the Vulkan backend's heap), patch
+//      inline literals to their slot, and bind a sampler argument buffer at
+//      dispatch time. STATIC_SAMPLER constants are resolved by SPECIALIZING
+//      the function (newFunctionWithName:constantValues:error:) — building any
+//      pipeline from a plain-fetched function out of a library that declares
+//      function constants aborts the process (uncatchable validateWithDevice
+//      assertion, with or without MTL_DEBUG_LAYER), so the constantValues path
+//      is mandatory, not an optimization. Metal samplers have no LOD bias;
+//      a non-zero STATIC_SAMPLER lodBias is logged and ignored.
 //
 //   7. Bindless texture/sampler heaps: Slang emits `textureHeap[]`,
 //      `rwTextureHeap[]`, and `ngapiSamplerHeap[]` as unbounded kernel
@@ -59,10 +68,12 @@
 #include "NoGraphicsAPI.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cassert>
 
@@ -87,6 +98,19 @@ struct MetalDevice
 
     std::mutex             allocMutex;
     std::vector<MetalAllocation> allocations;
+
+    // Raw (unretained) id<MTLTexture> pointers of live gpuCreateTexture
+    // textures. gpuDispatch validates texture-heap descriptors against this
+    // registry: the heap pointer is often a suballocation of a larger
+    // gpuMalloc page whose tail holds unrelated user data, and the heap scan
+    // must not mistake that data for descriptors. Guarded by allocMutex.
+    std::vector<const void*> textures;
+
+    // allocMutex must be held.
+    bool isLiveTexture(const void* p) const
+    {
+        return std::find(textures.begin(), textures.end(), p) != textures.end();
+    }
 
     MetalAllocation* findByCpu(void* ptr)
     {
@@ -134,9 +158,12 @@ struct GpuPipeline_T
     NSUInteger rwTextureHeapIndex = NSUIntegerMax;
     NSUInteger samplerHeapIndex   = NSUIntegerMax;
 
-    // Sampler argument buffer — built once at pipeline creation from inline
-    // sampler literals found in the MSL source.
+    // Sampler argument buffer — built once at pipeline creation from the
+    // sampler declarations found in the MSL source. The pipeline owns the
+    // sampler objects: the argument buffer only stores their GPU handles,
+    // which dangle if the MTLSamplerStates are released.
     id<MTLBuffer> samplerArgBuf = nil;
+    std::vector<id<MTLSamplerState>> samplers;
 };
 
 struct GpuQueue_T             { id<MTLCommandQueue>         queue; GpuDevice device; };
@@ -458,49 +485,161 @@ static MTLCompareFunction metalCompareFunction(uint32_t op)
     }
 }
 
-// Decode an NGAPI packed sampler state (lower 24 bits of an INLINE_SAMPLER value)
-// into an MTLSamplerState.
+// Decode an NGAPI packed 48-bit sampler state into an MTLSamplerState.
+// INLINE_SAMPLER 32-bit literals are widened to this form before the call
+// (lodBias 0 encoded as 128, minLod 0, maxLod unbounded).
 //
-// Bit layout (from Sampler.h NGAPI_SAMPLER_BITS):
-//   bit  0     minFilter
-//   bit  1     magFilter
-//   bit  2     mipFilter
-//   bits 3-5   addressU
-//   bits 6-8   addressV
+// Bit layout (from Sampler.h NGAPI_SAMPLER_BITS + STATIC_SAMPLER):
+//   bit  0     minFilter        bits 17-18  borderColor
+//   bit  1     magFilter        bits 19-22  compareOp (0 = none, 1..8 = VK-style ops)
+//   bit  2     mipFilter        bits 23-30  lodBias, (bias+8)*16 — no Metal equivalent
+//   bits 3-5   addressU         bits 31-38  minLod, lod*16
+//   bits 6-8   addressV         bits 39-46  maxLod, lod*16 (255 = unbounded)
 //   bits 9-11  addressW
 //   bits 12-16 maxAnisotropy
-//   bits 17-18 borderColor
-//   bits 19-22 compareOp (0 = none, 1..8 = VK-style ops)
-static id<MTLSamplerState> createSamplerFromBits(id<MTLDevice> device, uint32_t bits)
+static id<MTLSamplerState> createSamplerFromState(id<MTLDevice> device, uint64_t state)
 {
     MTLSamplerDescriptor* desc = [MTLSamplerDescriptor new];
-    desc.minFilter       = (bits & 0x01) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-    desc.magFilter       = (bits & 0x02) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-    desc.mipFilter       = (bits & 0x04) ? MTLSamplerMipFilterLinear   : MTLSamplerMipFilterNearest;
-    desc.sAddressMode    = metalAddressMode((bits >>  3) & 0x7);
-    desc.tAddressMode    = metalAddressMode((bits >>  6) & 0x7);
-    desc.rAddressMode    = metalAddressMode((bits >>  9) & 0x7);
-    uint32_t aniso       = (bits >> 12) & 0x1F;
+    desc.minFilter       = (state & 0x01) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    desc.magFilter       = (state & 0x02) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    desc.mipFilter       = (state & 0x04) ? MTLSamplerMipFilterLinear   : MTLSamplerMipFilterNearest;
+    desc.sAddressMode    = metalAddressMode((uint32_t)(state >>  3) & 0x7);
+    desc.tAddressMode    = metalAddressMode((uint32_t)(state >>  6) & 0x7);
+    desc.rAddressMode    = metalAddressMode((uint32_t)(state >>  9) & 0x7);
+    uint32_t aniso       = (uint32_t)(state >> 12) & 0x1F;
     desc.maxAnisotropy   = (aniso == 0) ? 1 : aniso;
-    desc.borderColor     = metalBorderColor((bits >> 17) & 0x3);
-    desc.compareFunction = metalCompareFunction((bits >> 19) & 0xF);
+    desc.borderColor     = metalBorderColor((uint32_t)(state >> 17) & 0x3);
+    desc.compareFunction = metalCompareFunction((uint32_t)(state >> 19) & 0xF);
+
+    // Metal samplers have no LOD bias; every shader in the repo declares 0.0.
+    const float lodBias = (float)((state >> 23) & 255) / 16.0f - 8.0f;
+    if (lodBias != 0.0f)
+        NSLog(@"NoGraphicsAPI Metal: sampler lodBias %.3f ignored (MTLSamplerDescriptor has no LOD bias)", lodBias);
+
+    desc.lodMinClamp = (float)((state >> 31) & 255) / 16.0f;
+    const uint32_t maxLodBits = (uint32_t)(state >> 39) & 255;
+    desc.lodMaxClamp = (maxLodBits == 255) ? FLT_MAX : (float)maxLodBits / 16.0f;
+
+    // Required for samplers written through an MTLArgumentEncoder.
+    desc.supportArgumentBuffers = YES;
     return [device newSamplerStateWithDescriptor:desc];
 }
 
-// Scan MSL source for Slang inline-sampler magic literals (top byte == 0x4E),
-// replace each with a compact slot index, and create MTLSamplerState objects.
-// Returns the patched MSL string; appends to outSamplers (sampler at slot i).
-static std::string patchInlineSamplers(
-    const std::string&              src,
-    id<MTLDevice>                   device,
-    std::vector<id<MTLSamplerState>>& outSamplers)
+// Packed state of the device default sampler at heap slot 0: min/mag LINEAR,
+// mip NEAREST, repeat xyz, aniso off, opaque-black border, no compare,
+// lodBias 0 (encoded 128), minLod 0, maxLod 0 — the exact zero-initialized
+// VkSamplerCreateInfo the Vulkan backend builds in gpuCreateDevice (maxLod 0
+// clamps to the base mip; it is NOT unbounded).
+static constexpr uint64_t kDefaultSamplerState = 0x3ull | (1ull << 17) | (128ull << 23);
+
+// Result of scanning one MSL source for sampler declarations. Slot 0 is
+// always the device default sampler — the Vulkan backend reserves heap slot 0
+// the same way, and shaders may read `ngapiSamplerHeap[0]` raw (samplerbench's
+// benchHardware does).
+struct SamplerScanResult
 {
+    std::vector<id<MTLSamplerState>> samplers;                      // heap slot -> sampler
+    std::vector<std::pair<NSUInteger, uint64_t>> functionConstants; // [[function_constant(i)]] -> value to specialize
+};
+
+// Scan MSL source for both Slang sampler-declaration forms:
+//
+//   INLINE_SAMPLER  — tagged 32-bit literals (top byte 0x4E): decoded, deduped
+//                     and patched in-place to the allocated heap slot.
+//   STATIC_SAMPLER  — slangc lowers the 64-bit spec constant to
+//                       constant ulong fc_X [[function_constant(N)]];
+//                       constant ulong X = is_function_constant_defined(fc_X)
+//                                              ? fc_X : <0x4E47-magic>ULL;
+//                     The packed state lives in the default literal; the heap
+//                     slot is injected by specializing constant N at function
+//                     creation (out.functionConstants). The source is left
+//                     untouched — once the constant is defined, the ternary
+//                     folds to it and the magic default is dead code.
+//
+// Both forms dedup on the canonical 48-bit state (inline literals widened with
+// neutral LOD fields exactly like the Vulkan backend), so identical effective
+// states share one hardware sampler. Returns the patched MSL string.
+static std::string patchSamplerLiterals(
+    const std::string& src,
+    id<MTLDevice>      device,
+    SamplerScanResult& out)
+{
+    out.samplers.push_back(createSamplerFromState(device, kDefaultSamplerState));
+
+    // Canonical 48-bit state -> heap slot (slots start at 1; slot 0 is the
+    // default sampler and is not part of the dedup map, matching Vulkan).
+    std::vector<std::pair<uint64_t, uint32_t>> seen;
+    auto slotFor = [&](uint64_t state) -> uint32_t {
+        for (const auto& e : seen)
+            if (e.first == state) return e.second;
+        uint32_t slot = (uint32_t)out.samplers.size();
+        seen.push_back({state, slot});
+        out.samplers.push_back(createSamplerFromState(device, state));
+        return slot;
+    };
+
+    // --- STATIC_SAMPLER: function-constant declarations -------------------
+    static const char kFcAttr[] = "[[function_constant(";
+    const size_t kFcAttrLen = sizeof(kFcAttr) - 1;
+    for (size_t at = src.find(kFcAttr); at != std::string::npos; at = src.find(kFcAttr, at + 1))
+    {
+        // Constant index inside the attribute.
+        size_t d = at + kFcAttrLen;
+        bool haveIndex = d < src.size() && isdigit((unsigned char)src[d]);
+        NSUInteger index = 0;
+        while (d < src.size() && isdigit((unsigned char)src[d]))
+            index = index * 10 + (NSUInteger)(src[d++] - '0');
+
+        // Declared name: walk back over whitespace, then identifier chars.
+        size_t end = at;
+        while (end > 0 && isspace((unsigned char)src[end - 1])) --end;
+        size_t begin = end;
+        while (begin > 0 && (isalnum((unsigned char)src[begin - 1]) || src[begin - 1] == '_')) --begin;
+        std::string name = src.substr(begin, end - begin);
+        if (!haveIndex || name.empty())
+            continue;
+
+        // Paired default: the first `<name> : <digits>ULL` after the
+        // declaration (the false arm of the is_function_constant_defined
+        // ternary slangc emits).
+        uint64_t value = 0;
+        bool haveValue = false;
+        for (size_t use = src.find(name, at + 1); use != std::string::npos; use = src.find(name, use + 1))
+        {
+            size_t p = use + name.size();
+            while (p < src.size() && isspace((unsigned char)src[p])) ++p;
+            if (p >= src.size() || src[p] != ':') continue;
+            ++p;
+            while (p < src.size() && isspace((unsigned char)src[p])) ++p;
+            if (p >= src.size() || !isdigit((unsigned char)src[p])) continue;
+            uint64_t v = 0;
+            while (p < src.size() && isdigit((unsigned char)src[p]))
+                v = v * 10 + (uint64_t)(src[p++] - '0');
+            value = v;
+            haveValue = true;
+            break;
+        }
+        if (!haveValue)
+        {
+            // Every function constant MUST be specialized (see friction log 6);
+            // leaving it unset makes function creation fail with an NSError,
+            // which gpuCreateComputePipeline reports.
+            assert(false && "Metal: [[function_constant]] without a parsable integer default");
+            continue;
+        }
+
+        if ((value & STATIC_SAMPLER_MAGIC_MASK) == STATIC_SAMPLER_MAGIC)
+            out.functionConstants.push_back({index, (uint64_t)slotFor(value & ~STATIC_SAMPLER_MAGIC_MASK)});
+        else
+            // Not a sampler constant (nothing in the repo emits these today):
+            // specialize it to its own default, which preserves semantics.
+            out.functionConstants.push_back({index, value});
+    }
+
+    // --- INLINE_SAMPLER: tagged 32-bit literals, patched in place ---------
     // Inline sampler magic: top byte == 0x4E (see INLINE_SAMPLER_MAGIC in Sampler.h)
     static constexpr uint32_t MAGIC_MASK = 0xFF000000u;
     static constexpr uint32_t MAGIC_VAL  = 0x4E000000u;
-
-    struct SamplerEntry { uint32_t bits; uint32_t slot; };
-    std::vector<SamplerEntry> seen;
 
     std::string result;
     result.reserve(src.size());
@@ -526,7 +665,9 @@ static std::string patchInlineSamplers(
             continue;
         }
 
-        // Parse the number; cap at uint32 to avoid overflow
+        // Parse the number; cap at uint32 to avoid overflow (64-bit ULL
+        // literals — including STATIC_SAMPLER defaults — are left verbatim,
+        // they are handled by the function-constant pass above).
         uint64_t val64 = 0;
         bool overflow = false;
         for (size_t k = i; k < j; ++k)
@@ -537,18 +678,11 @@ static std::string patchInlineSamplers(
 
         if (!overflow && ((uint32_t)val64 & MAGIC_MASK) == MAGIC_VAL)
         {
-            uint32_t bits = (uint32_t)val64 & ~MAGIC_MASK;
-
-            uint32_t slot = (uint32_t)outSamplers.size();
-            for (const auto& e : seen)
-                if (e.bits == bits) { slot = e.slot; goto found_slot; }
-
-            // New unique sampler
-            seen.push_back({bits, slot});
-            outSamplers.push_back(createSamplerFromBits(device, bits));
-
-            found_slot:
-            result += std::to_string(slot);
+            // Canonicalize to the 48-bit layout exactly like the Vulkan
+            // backend: bits 0-22 of the literal, lodBias 0 (encoded 128),
+            // minLod 0, maxLod unbounded.
+            const uint64_t state = (val64 & 0x7fffff) | (128ull << 23) | (255ull << 39);
+            result += std::to_string(slotFor(state));
             result += src[j]; // 'U' or 'u'
             i = j + 1;
             continue;
@@ -560,6 +694,35 @@ static std::string patchInlineSamplers(
     }
 
     return result;
+}
+
+// Find the name of the function carrying `attr` ("[[kernel]]", "[[vertex]]",
+// "[[fragment]]") in MSL source by locating the '(' that opens its parameter
+// list and walking back over the identifier. library.functionNames exposes
+// only entry points and slangc renames entries ('main' -> 'main_0'; render
+// libraries contain non-entry helpers with entry-like names), so the source
+// is the only reliable name authority. When `entry` is non-null, prefers the
+// attributed function whose name matches or starts with it; falls back to the
+// first attributed function (per-entry .metal files contain exactly one).
+// Returns "" when no attributed function exists.
+static std::string findEntryName(const std::string& src, const char* attr, const char* entry)
+{
+    std::string fallback;
+    const size_t attrLen = strlen(attr);
+    for (size_t at = src.find(attr); at != std::string::npos; at = src.find(attr, at + 1))
+    {
+        size_t paren = src.find('(', at + attrLen);
+        if (paren == std::string::npos) continue;
+        size_t end = paren;
+        while (end > at && isspace((unsigned char)src[end - 1])) --end;
+        size_t begin = end;
+        while (begin > at && (isalnum((unsigned char)src[begin - 1]) || src[begin - 1] == '_')) --begin;
+        std::string name = src.substr(begin, end - begin);
+        if (name.empty()) continue;
+        if (entry && name.compare(0, strlen(entry), entry) == 0) return name;
+        if (fallback.empty()) fallback = name;
+    }
+    return fallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -595,11 +758,22 @@ GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* /*ptrGp
         NSLog(@"gpuCreateTexture: newTextureWithDescriptor failed");
         return nullptr;
     }
+    {
+        std::lock_guard lock(device->metalDevice->allocMutex);
+        device->metalDevice->textures.push_back((__bridge const void*)tex);
+    }
     return new GpuTexture_T{ tex, device };
 }
 
 void gpuDestroyTexture(GpuTexture texture)
 {
+    if (!texture) return;
+    auto* md = texture->device->metalDevice;
+    {
+        std::lock_guard lock(md->allocMutex);
+        auto& v = md->textures;
+        v.erase(std::remove(v.begin(), v.end(), (__bridge const void*)texture->texture), v.end());
+    }
     delete texture;
 }
 
@@ -649,7 +823,8 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
         }
     }
 
-    std::vector<id<MTLSamplerState>> samplers;
+    SamplerScanResult samplerScan; // MSL source path only; samplers[0] = default
+    std::string patched;           // patched MSL source (kept for the scans below)
 
     if (isMetallib)
     {
@@ -660,9 +835,10 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     else
     {
         // Treat bytes as UTF-8 MSL source. Patch inline sampler magic literals
-        // before compilation so the ngapiSamplerHeap index stays small.
+        // before compilation so the ngapiSamplerHeap index stays small, and
+        // collect the STATIC_SAMPLER function-constant slots.
         std::string src(reinterpret_cast<const char*>(ir.data()), ir.size());
-        std::string patched = patchInlineSamplers(src, md->device, samplers);
+        patched = patchSamplerLiterals(src, md->device, samplerScan);
 
         NSString* msl = [NSString stringWithUTF8String:patched.c_str()];
         MTLCompileOptions* opts = [MTLCompileOptions new];
@@ -676,14 +852,51 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
         return nullptr;
     }
 
-    // Slang renames 'main' to 'main_0' in Metal output (main is reserved in C).
-    NSString* entryName = entry ? [NSString stringWithUTF8String:entry] : @"main_0";
-    if ([entryName isEqualToString:@"main"]) entryName = @"main_0";
+    // Entry-name resolution. For MSL source, scan for the [[kernel]] function
+    // (see findEntryName — functionNames/hardcoded fallbacks are unreliable);
+    // for .metallib there is no source, keep the historical 'main_0' mapping.
+    NSString* entryName = nil;
+    if (isMetallib)
+    {
+        entryName = entry ? [NSString stringWithUTF8String:entry] : @"main_0";
+        if ([entryName isEqualToString:@"main"]) entryName = @"main_0";
+    }
+    else
+    {
+        std::string scanned = findEntryName(patched, "[[kernel]]", entry);
+        if (scanned.empty())
+        {
+            NSLog(@"gpuCreateComputePipeline: no [[kernel]] function in MSL source (entry '%s')",
+                  entry ? entry : "(default)");
+            return nullptr;
+        }
+        entryName = [NSString stringWithUTF8String:scanned.c_str()];
+    }
 
-    id<MTLFunction> fn = [lib newFunctionWithName:entryName];
+    // A library whose source declares function constants MUST have its
+    // functions created via newFunctionWithName:constantValues:error: with
+    // every constant set — building any pipeline state from a plain-fetched
+    // function out of such a library aborts the process (uncatchable Metal
+    // validateWithDevice assertion; there is no NSError fallback).
+    id<MTLFunction> fn = nil;
+    if (!isMetallib && patched.find("[[function_constant(") != std::string::npos)
+    {
+        MTLFunctionConstantValues* cv = [MTLFunctionConstantValues new];
+        for (const auto& fc : samplerScan.functionConstants)
+        {
+            uint64_t value = fc.second;
+            [cv setConstantValue:&value type:MTLDataTypeULong atIndex:fc.first];
+        }
+        fn = [lib newFunctionWithName:entryName constantValues:cv error:&err];
+    }
+    else
+    {
+        fn = [lib newFunctionWithName:entryName];
+    }
     if (!fn)
     {
-        NSLog(@"gpuCreateComputePipeline: entry '%@' not found", entryName);
+        NSLog(@"gpuCreateComputePipeline: entry '%@' not found or specialization failed: %@",
+              entryName, err);
         return nullptr;
     }
 
@@ -714,7 +927,11 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     }
 
     // Pre-build sampler argument buffer (stays constant for this pipeline).
+    // The samplers vector is never empty on the MSL source path (slot 0 is the
+    // default sampler), so any kernel that binds ngapiSamplerHeap gets a real
+    // heap — including ones with zero patched literals that read slot 0 raw.
     id<MTLBuffer> samplerArgBuf = nil;
+    const auto& samplers = samplerScan.samplers;
     if (!samplers.empty() && samplerHeapIdx != NSUIntegerMax)
     {
         MTLArgumentDescriptor* ad = [MTLArgumentDescriptor argumentDescriptor];
@@ -740,6 +957,7 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
     p->rwTextureHeapIndex= rwTexHeapIdx;
     p->samplerHeapIndex  = samplerHeapIdx;
     p->samplerArgBuf     = samplerArgBuf;
+    p->samplers          = std::move(samplerScan.samplers);
     return p;
 }
 
@@ -862,11 +1080,20 @@ void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
                 static_cast<const uint8_t*>(heapAlloc->cpuPtr) + offset);
             NSUInteger numDescs = (NSUInteger)((heapAlloc->size - offset) / sizeof(GpuTextureDescriptor));
 
+            // The lock guards the texture registry; the heap may be a
+            // suballocation of a larger gpuMalloc page whose tail holds
+            // unrelated user data, so a slot only counts as occupied when
+            // data[0] is a live gpuCreateTexture texture.
+            std::lock_guard lock(md->allocMutex);
+            auto occupied = [&](NSUInteger k) {
+                return descs[k].data[0] && md->isLiveTexture((const void*)descs[k].data[0]);
+            };
+
             // Scan descriptors to find the highest occupied slot for each heap type.
             NSUInteger maxSampledSlot = 0, maxStorageSlot = 0;
             for (NSUInteger k = 0; k < numDescs; ++k)
             {
-                if (!descs[k].data[0]) continue;
+                if (!occupied(k)) continue;
                 if (descs[k].data[1] == 0) maxSampledSlot = k + 1;
                 else                       maxStorageSlot = k + 1;
             }
@@ -887,7 +1114,7 @@ void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
                 [argEnc setArgumentBuffer:argBuf offset:0];
                 for (NSUInteger k = 0; k < maxSampledSlot; ++k)
                 {
-                    if (descs[k].data[0] && descs[k].data[1] == 0)
+                    if (occupied(k) && descs[k].data[1] == 0)
                     {
                         auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
                         [argEnc setTexture:tex atIndex:k];
@@ -914,7 +1141,7 @@ void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
                 [argEnc setArgumentBuffer:argBuf offset:0];
                 for (NSUInteger k = 0; k < maxStorageSlot; ++k)
                 {
-                    if (descs[k].data[0] && descs[k].data[1] == 1)
+                    if (occupied(k) && descs[k].data[1] == 1)
                     {
                         auto tex = (__bridge id<MTLTexture>)(void*)descs[k].data[0];
                         [argEnc setTexture:tex atIndex:k];

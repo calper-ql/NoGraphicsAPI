@@ -111,7 +111,11 @@ function(compile_metal_shader)
                 "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RewriteMetalHeaps.py"
                 "${OUT_FILE}"
             ${_PREPEND_CMD}
+            # The post-processing scripts are inputs too: editing the rewriter
+            # must regenerate every output.
             DEPENDS "${S_SOURCE}" ${S_EXTRA_DEPENDS}
+                    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/RewriteMetalHeaps.py"
+                    "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/PrependMetalComment.cmake"
             COMMENT "Compiling Metal shader ${entry} -> ${OUT_FILE}"
             VERBATIM)
 

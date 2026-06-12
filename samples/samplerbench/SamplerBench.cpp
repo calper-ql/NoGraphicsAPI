@@ -106,12 +106,31 @@ int main()
     LinearAllocator allocator(device);
     auto queue = gpuCreateQueue(device);
 
+#ifdef GPU_METAL_BACKEND
+    // Metal: each entry point is compiled to its own .metal file so that
+    // EntryPointParams is always at [[buffer(0)]] in every kernel.
+    auto loadBench = [](const char* entry)
+    {
+        return loadIR(std::string("shaders/samplerbench/SamplerBench_") + entry + ".metal");
+    };
+    auto hwIR = loadBench("benchHardware");
+    auto staticIR = loadBench("benchStatic");
+    auto inlineIR = loadBench("benchInline");
+    auto staticNearestIR = loadBench("benchStaticNearest");
+    auto manualNearestIR = loadBench("benchManualNearest");
+    auto hwPipeline = gpuCreateComputePipeline(device, ByteSpan(hwIR.data(), hwIR.size()), "benchHardware");
+    auto staticPipeline = gpuCreateComputePipeline(device, ByteSpan(staticIR.data(), staticIR.size()), "benchStatic");
+    auto inlinePipeline = gpuCreateComputePipeline(device, ByteSpan(inlineIR.data(), inlineIR.size()), "benchInline");
+    auto staticNearestPipeline = gpuCreateComputePipeline(device, ByteSpan(staticNearestIR.data(), staticNearestIR.size()), "benchStaticNearest");
+    auto manualNearestPipeline = gpuCreateComputePipeline(device, ByteSpan(manualNearestIR.data(), manualNearestIR.size()), "benchManualNearest");
+#else
     auto benchIR = loadIR("shaders/samplerbench/Bench.spv");
     auto hwPipeline = gpuCreateComputePipeline(device, ByteSpan(benchIR.data(), benchIR.size()), "benchHardware");
     auto staticPipeline = gpuCreateComputePipeline(device, ByteSpan(benchIR.data(), benchIR.size()), "benchStatic");
     auto inlinePipeline = gpuCreateComputePipeline(device, ByteSpan(benchIR.data(), benchIR.size()), "benchInline");
     auto staticNearestPipeline = gpuCreateComputePipeline(device, ByteSpan(benchIR.data(), benchIR.size()), "benchStaticNearest");
     auto manualNearestPipeline = gpuCreateComputePipeline(device, ByteSpan(benchIR.data(), benchIR.size()), "benchManualNearest");
+#endif
 
     const uint32_t width = 1024, height = 1024;
     const size_t textureBytes = static_cast<size_t>(width) * height * 4;

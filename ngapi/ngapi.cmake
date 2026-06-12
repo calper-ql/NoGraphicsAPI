@@ -51,6 +51,12 @@ if(NGAPI_METAL_BACKEND)
     target_include_directories(ngapi PUBLIC "${NGAPI_INCLUDE_DIR}")
     target_include_directories(ngapi PRIVATE "${NGAPI_DIR}/src")
     target_compile_definitions(ngapi PUBLIC GPU_METAL_BACKEND)
+    # The backend stores autoreleased Metal objects (command buffers, encoders)
+    # in C++ structs and relies on ARC to retain them. Without ARC they dangle
+    # as soon as an autorelease pool drains — e.g. when a worker thread that
+    # recorded a not-yet-submitted command buffer exits (multithreading
+    # sample, phase 2).
+    target_compile_options(ngapi PRIVATE -fobjc-arc)
     target_link_libraries(ngapi PRIVATE
         "-framework Metal"
         "-framework Foundation"
