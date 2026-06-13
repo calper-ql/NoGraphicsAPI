@@ -72,9 +72,9 @@
 //   bit  2     mipFilter        bits 19-22  compare (0 = off, else op + 1)
 //   bits 3-5   addressU
 //   bits 6-8   addressV         STATIC_SAMPLER only (quantized to 1/16):
-//   bits 9-11  addressW         bits 23-30  lodBias + 8.0
-//                               bits 31-38  minLod
-//                               bits 39-46  maxLod (255 = unbounded)
+//   bits 9-11  addressW         bits 23-30  lodBias + 8.0 (range -8 .. +7.9375)
+//                               bits 31-38  minLod (0 .. 15.9375)
+//                               bits 39-46  maxLod (255 = unbounded; >=15.9375 unbounded)
 #define STATIC_SAMPLER_MAGIC_MASK 0xffff000000000000ULL
 #define STATIC_SAMPLER_MAGIC 0x4E47000000000000ULL // "NG"
 #define INLINE_SAMPLER_MAGIC_MASK 0xff000000u
@@ -129,8 +129,10 @@ struct HwSampler
     [SpecializationConstant] const uint64_t name##_ngapiSlot =                                                 \
         STATIC_SAMPLER_MAGIC |                                                                                 \
         uint64_t(NGAPI_SAMPLER_BITS(minF, magF, mipF, aU, aV, aW, maxAniso, border, compare)) |                \
-        (uint64_t(((lodBias) + 8.0) * 16.0 + 0.5) << 23) |                                                     \
-        (uint64_t((minLod) * 16.0 + 0.5) << 31) |                                                              \
+        /* Each field is 8 bits; clamp to the representable range so a boundary  */                            \
+        /* value (e.g. lodBias +8.0 -> 256) cannot overflow into the next field. */                            \
+        (uint64_t((((lodBias) < -8.0 ? -8.0 : (lodBias) > 7.9375 ? 7.9375 : (lodBias)) + 8.0) * 16.0 + 0.5) << 23) | \
+        (uint64_t(((minLod) < 0.0 ? 0.0 : (minLod) > 15.9375 ? 15.9375 : (minLod)) * 16.0 + 0.5) << 31) |       \
         (uint64_t(((maxLod) >= 16.0 ? 15.9375 : (maxLod)) * 16.0 + 0.5) << 39);                                \
     HwSampler name()                                                                                           \
     {                                                                                                          \

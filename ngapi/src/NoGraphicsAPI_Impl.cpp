@@ -1502,15 +1502,26 @@ uint32_t staticSamplerSlot(VulkanDevice* vulkanDevice, uint64_t packedState)
 
     const VkPhysicalDeviceLimits& limits = vulkanDevice->physicalDeviceProperties2.properties.limits;
 
+    // The address-mode field is 3 bits (0-7) but only 0-4 are defined; the
+    // border field is 2 bits (0-3) but only 0-2 are defined. Authored misuse or
+    // a literal collision (see Sampler.h) can set an out-of-range value, so fall
+    // back to the index-0 default rather than reading past the array (the Metal
+    // backend's decode does the same via its switch `default:`).
+    auto addressMode = [&](uint32_t shift) {
+        const uint32_t i = (packedState >> shift) & 7;
+        return i < std::size(addressModes) ? addressModes[i] : addressModes[0];
+    };
+    const uint32_t borderIdx = (packedState >> 17) & 3;
+
     VkSamplerCreateInfo samplerInfo = {};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.minFilter = filters[packedState & 1];
     samplerInfo.magFilter = filters[(packedState >> 1) & 1];
     samplerInfo.mipmapMode = mipModes[(packedState >> 2) & 1];
-    samplerInfo.addressModeU = addressModes[(packedState >> 3) & 7];
-    samplerInfo.addressModeV = addressModes[(packedState >> 6) & 7];
-    samplerInfo.addressModeW = addressModes[(packedState >> 9) & 7];
-    samplerInfo.borderColor = borderColors[(packedState >> 17) & 3];
+    samplerInfo.addressModeU = addressMode(3);
+    samplerInfo.addressModeV = addressMode(6);
+    samplerInfo.addressModeW = addressMode(9);
+    samplerInfo.borderColor = borderColors[borderIdx < std::size(borderColors) ? borderIdx : 0];
 
     const uint32_t maxAnisotropy = (packedState >> 12) & 31;
     if (maxAnisotropy > 1)
@@ -2913,7 +2924,13 @@ void gpuPresent(GpuSwapchain swapchain, GpuSemaphore sema, uint64_t value)
     // The transition below submits on the graphics queue and presents on the
     // present queue; both are externally synchronized, and the transition
     // command buffer comes from the device-level pool — one lock covers all.
-    std::lock_guard lock(vulkanDevice->submitMutex);
+    // The lock is released before any swapchain rebuild below: recreateSwapchain
+    // must run WITHOUT submitMutex held, or a minimized window's 0x0-surface
+    // stall in buildSwapchainResources would block every other thread's
+    // gpuSubmit / gpuWaitSemaphore for the entire minimized duration. The
+    // acquire-side recreate in gpuSwapchainImage is already lockless; this
+    // mirrors it.
+    std::unique_lock<std::mutex> lock(vulkanDevice->submitMutex);
 
     // The presentation engine requires the image in PRESENT_SRC. Record that
     // transition into this image's reusable command buffer; the prior present of
@@ -2980,6 +2997,8 @@ void gpuPresent(GpuSwapchain swapchain, GpuSemaphore sema, uint64_t value)
     VkResult result = vulkanDevice->dispatchTable.queuePresentKHR(
         swapchain->presentQueue,
         &presentInfo);
+
+    lock.unlock(); // release before any swapchain rebuild (see the lock comment)
 
     // OUT_OF_DATE rejects the present (its semaphore wait still executes, so
     // nothing is left pending); SUBOPTIMAL presents but signals the chain no
