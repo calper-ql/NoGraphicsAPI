@@ -106,11 +106,23 @@ target_link_libraries(ngapi-samples-common
 if(NOT DEFINED VULKAN_SDK AND DEFINED ENV{VULKAN_SDK})
     set(VULKAN_SDK $ENV{VULKAN_SDK})
 endif()
-# Use PATHS (not HINTS) so system PATH is searched before the Vulkan SDK bin.
-# Metal shaders require slangc 2026+ for the device-pointer MSL calling convention;
-# a PATH-installed slangc is usually newer than the one bundled in the SDK.
-unset(SLANGC CACHE)
-find_program(SLANGC slangc PATHS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+# Respect an explicit -DSLANGC=<path> override (documented in ngapi/README.md);
+# only search when it was not provided. find_program no-ops when SLANGC already
+# holds a valid path, so this also avoids re-resolving on every reconfigure.
+if(NOT SLANGC)
+    if(NGAPI_METAL_BACKEND)
+        # Metal shaders require slangc 2026+ for the device-pointer MSL calling
+        # convention; a PATH-installed slangc is usually newer than the one
+        # bundled in the SDK. PATHS is consulted after the system PATH, so this
+        # prefers a PATH slangc and falls back to the SDK.
+        find_program(SLANGC slangc PATHS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+    else()
+        # Vulkan/Linux path: SDK-first via HINTS (unchanged from main), so the
+        # SPIR-V the samples/tests compile is not silently retargeted to whatever
+        # slangc happens to be on PATH.
+        find_program(SLANGC slangc HINTS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+    endif()
+endif()
 if(NOT SLANGC)
     message(FATAL_ERROR "slangc not found; set VULKAN_SDK or put slangc on PATH. "
         "(Only the samples and tests need it — consuming the ngapi/ library does not.)")
@@ -136,9 +148,20 @@ set(METAL_SHADER_DEPS
     "${NGAPI_INCLUDE_DIR}/Sampler.h")
 
 set(NGAPI_METAL_SHADER_OUTPUTS "")
+# Tensor kernels carry per-entry threadgroup sizes. The Metal backend reads the
+# size from the "// NGAPI_THREADS" comment (no max_total_threads attribute is
+# emitted), defaulting to {64,1,1} when absent — so the two single-thread
+# kernels MUST get an explicit "1 1 1" or they would launch 64 threads and run
+# 64x redundant (and on a non-idempotent kernel, wrong) work versus Vulkan.
 compile_metal_shader(SOURCE samples/learning/Tensor.slang STAGE compute
     OUTPUT learning/Tensor.metal
-    ENTRY _add _sub _mul _div _dot _mT _matmul _pow _tanh
+    ENTRY _add _sub _mul _div _matmul _pow _tanh
+    NUMTHREADS "64 1 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
+compile_metal_shader(SOURCE samples/learning/Tensor.slang STAGE compute
+    OUTPUT learning/Tensor.metal
+    ENTRY _dot _mT
+    NUMTHREADS "1 1 1"
     EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
 
 compile_metal_shader(SOURCE samples/compute/Compute.slang STAGE compute

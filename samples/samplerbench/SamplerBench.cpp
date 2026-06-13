@@ -179,6 +179,8 @@ int main()
 
     const uint3 grid = { (width + 15) / 16, (height + 15) / 16, 1 };
 
+    bool ok = true; // cross-check result; drives the exit code (see end of main)
+
     // Scoped so the timer's semaphore dies before the device teardown below.
     {
         BatchTimer timer(device, queue);
@@ -197,7 +199,7 @@ int main()
             return maxDiff <= allowed;
         };
 
-        bool ok = true;
+        ok = true;
         ok &= compare(staticPipeline, inlinePipeline, "static vs inline (same state):", 0);
         ok &= compare(staticNearestPipeline, manualNearestPipeline, "static NEAREST vs manual Load:", 0);
         std::printf("\n");
@@ -240,5 +242,5 @@ int main()
     gpuDestroyQueue(queue);
     gpuDestroyDevice(device);
     gpuDestroyInstance();
-    return 0;
+    return ok ? 0 : 1; // nonzero on cross-check failure so CI/scripts can gate on it
 }

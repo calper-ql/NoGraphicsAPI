@@ -19,10 +19,11 @@
 //   2. gpuDispatch data pointer: Vulkan passes a raw VkDeviceAddress via push
 //      constants; the shader dereferences it directly. Slang's MSL output wraps
 //      the entry-point parameters in `EntryPointParams_N constant* [[buffer(N)]]`
-//      where the struct contains the data pointer. We use setBytes(&gpuAddr,8,N)
-//      to pass the 8-byte GPU address as a constant buffer — the shader reads
-//      `entryPointParams->data` and dereferences it as a device pointer (works
-//      on Apple Silicon's unified address space). N is determined at pipeline
+//      where the struct contains the data pointer. We pass the 8-byte GPU
+//      address in a small per-call MTLBuffer (newBufferWithBytes) bound at
+//      buffer(N) — the shader reads `entryPointParams->data` and dereferences
+//      it as a device pointer (works on Apple Silicon's unified address space;
+//      see item 14 on the per-call allocation). N is determined at pipeline
 //      creation via MTLComputePipelineReflection (single-entry .metal files
 //      always get N=0; multi-entry files assign N by entry-point order).
 //
@@ -140,8 +141,10 @@ struct MetalDevice
 {
     id<MTLDevice> device;
 
-    // Lazily-compiled compute PSO used by gpuBlitTexture.
+    // Lazily-compiled compute PSO used by gpuBlitTexture (guarded by blitPsoOnce
+    // for concurrent first use across recording threads).
     id<MTLComputePipelineState> blitPso = nil;
+    std::once_flag              blitPsoOnce;
 
     std::mutex             allocMutex;
     std::vector<MetalAllocation> allocations;
@@ -176,6 +179,19 @@ struct MetalDevice
                 return &a;
         return nullptr;
     }
+
+    // Copy out the allocation containing `addr` (by value) under the caller's
+    // lock. The pointer from findByGpu dangles the moment another thread's
+    // gpuMalloc reallocates `allocations` or gpuFree erases from it — both
+    // permitted concurrently by the threading contract — so any site that
+    // dereferences past the lock scope must take a copy here instead. Mirrors
+    // the Vulkan backend's by-value VulkanDevice::findAllocation.
+    bool findByGpuValue(uint64_t addr, MetalAllocation& out)
+    {
+        std::lock_guard lock(allocMutex);
+        if (MetalAllocation* a = findByGpu(addr)) { out = *a; return true; }
+        return false;
+    }
 };
 
 struct GpuDevice_T          { MetalDevice* metalDevice = nullptr; };
@@ -202,7 +218,6 @@ struct GpuPipeline_T
 {
     PipelineKind                kind = PIPELINE_COMPUTE;
     id<MTLComputePipelineState> pso;
-    id<MTLFunction>             fn;               // retained for argument encoder creation
     GpuDevice                   device;
     NSUInteger                  entryParamsIndex   = 0;
     uint3                       threadgroupSize    = {64, 1, 1};
@@ -281,13 +296,23 @@ struct GpuCommandBuffer_T
     // exist before any state can be set on it.
     bool graphicsStateBound = false;
 
+    // Which compute PSO is currently set on the live compute encoder (nullptr =
+    // none/unknown). The PSO is encoder-local state, but the encoder is torn
+    // down and rebuilt on every blit/copy/render-pass switch, and gpuBlitTexture
+    // overwrites it with the internal blit kernel. Vulkan's bind persists across
+    // the whole command buffer, so callers expect set-pipeline-once /
+    // dispatch-many to survive intervening copies. gpuDispatch re-binds lazily
+    // when this no longer matches currentPipeline; the encoder helpers and
+    // gpuBlitTexture clear it whenever the bound PSO is lost.
+    GpuPipeline boundComputePipeline = nullptr;
+
     // The render encoder is never created lazily (it needs the pass
     // descriptor), so blit()/compute() assert rather than auto-end it —
     // ending a render pass implicitly would silently split the user's pass.
     id<MTLBlitCommandEncoder> blit()
     {
         assert(!renderEnc && "Metal: blit inside a render pass is invalid");
-        if (computeEnc) { [computeEnc endEncoding]; computeEnc = nil; }
+        if (computeEnc) { [computeEnc endEncoding]; computeEnc = nil; boundComputePipeline = nullptr; }
         if (!blitEnc)    blitEnc = [cb blitCommandEncoder];
         return blitEnc;
     }
@@ -303,7 +328,7 @@ struct GpuCommandBuffer_T
     void endAll() // render encoder is normally already ended by gpuEndRenderPass
     {
         if (blitEnc)    { [blitEnc endEncoding];    blitEnc    = nil; }
-        if (computeEnc) { [computeEnc endEncoding]; computeEnc = nil; }
+        if (computeEnc) { [computeEnc endEncoding]; computeEnc = nil; boundComputePipeline = nullptr; }
         if (renderEnc)  { [renderEnc endEncoding];  renderEnc  = nil; }
     }
 };
@@ -694,8 +719,11 @@ static id<MTLSamplerState> createSamplerFromState(id<MTLDevice> device, uint64_t
     desc.sAddressMode    = metalAddressMode((uint32_t)(state >>  3) & 0x7);
     desc.tAddressMode    = metalAddressMode((uint32_t)(state >>  6) & 0x7);
     desc.rAddressMode    = metalAddressMode((uint32_t)(state >>  9) & 0x7);
+    // The field is 5 bits (0-31) but MTLSamplerDescriptor.maxAnisotropy is valid
+    // only in [1, 16]; an out-of-range value aborts under the Metal debug layer.
+    // Clamp like the Vulkan backend does against maxSamplerAnisotropy.
     uint32_t aniso       = (uint32_t)(state >> 12) & 0x1F;
-    desc.maxAnisotropy   = (aniso == 0) ? 1 : aniso;
+    desc.maxAnisotropy   = (aniso < 1) ? 1 : (aniso > 16) ? 16 : aniso;
     desc.borderColor     = metalBorderColor((uint32_t)(state >> 17) & 0x3);
     desc.compareFunction = metalCompareFunction((uint32_t)(state >> 19) & 0xF);
 
@@ -895,7 +923,8 @@ static std::string patchSamplerLiterals(
 // Returns "" when no attributed function exists.
 static std::string findEntryName(const std::string& src, const char* attr, const char* entry)
 {
-    std::string fallback;
+    std::string first;
+    int count = 0;
     const size_t attrLen = strlen(attr);
     for (size_t at = src.find(attr); at != std::string::npos; at = src.find(attr, at + 1))
     {
@@ -907,10 +936,18 @@ static std::string findEntryName(const std::string& src, const char* attr, const
         while (begin > at && (isalnum((unsigned char)src[begin - 1]) || src[begin - 1] == '_')) --begin;
         std::string name = src.substr(begin, end - begin);
         if (name.empty()) continue;
+        ++count;
         if (entry && name.compare(0, strlen(entry), entry) == 0) return name;
-        if (fallback.empty()) fallback = name;
+        if (first.empty()) first = name;
     }
-    return fallback;
+    // With no requested entry, or a file holding exactly one attributed
+    // function (the per-entry .metal convention, where slangc may have renamed
+    // the entry so it no longer textually matches), the sole function is
+    // unambiguous. But if a specific entry was requested and there were several
+    // candidates, none matching, fail loudly rather than silently compiling the
+    // wrong kernel under the requested name.
+    if (!entry || count <= 1) return first;
+    return {};
 }
 
 // Build a Tier-2 sampler argument buffer holding `samplers` at indices [0, n).
@@ -977,6 +1014,16 @@ GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* /*ptrGp
     td.arrayLength      = (desc.type == TEXTURE_2D_ARRAY || desc.type == TEXTURE_CUBE_ARRAY)
                               ? desc.layerCount : 1;
     td.sampleCount      = desc.sampleCount;
+    if (desc.sampleCount > 1)
+    {
+        // Metal has a distinct multisample texture type; leaving textureType at
+        // the plain 2D value with sampleCount > 1 fails descriptor validation
+        // (process abort), where the Vulkan backend just creates the MSAA image.
+        assert((desc.type == TEXTURE_2D || desc.type == TEXTURE_2D_ARRAY) &&
+               "Metal: multisampling is only supported for 2D textures");
+        td.textureType = (desc.type == TEXTURE_2D_ARRAY) ? MTLTextureType2DMultisampleArray
+                                                         : MTLTextureType2DMultisample;
+    }
     td.usage            = metalTextureUsage(desc.usage);
     td.storageMode      = MTLStorageModePrivate;
 
@@ -1157,7 +1204,6 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan ir, const char* 
 
     auto* p              = new GpuPipeline_T{};
     p->pso               = pso;
-    p->fn                = fn;
     p->device            = device;
     p->entryParamsIndex  = paramsIndex;
     p->threadgroupSize   = tgSize;
@@ -1395,18 +1441,15 @@ GpuCommandBuffer gpuStartCommandRecording(GpuQueue queue)
 
 void gpuSetPipeline(GpuCommandBuffer cb, GpuPipeline pipeline)
 {
+    // Record-only for both kinds. Compute used to bind the PSO eagerly on the
+    // current encoder, but that binding is lost the moment the encoder is torn
+    // down by an intervening copy/blit/render pass before the dispatch; the PSO
+    // is now (re)bound lazily in gpuDispatch/gpuDispatchIndirect. Graphics binds
+    // lazily at the first draw because the API order is setPipeline ->
+    // beginRenderPass and the render encoder does not exist yet.
     cb->currentPipeline = pipeline;
-    if (pipeline->kind == PIPELINE_COMPUTE)
-    {
-        auto enc = cb->compute();
-        [enc setComputePipelineState:pipeline->pso];
-    }
-    else
-    {
-        // Record-only. The API order is setPipeline -> beginRenderPass, so the
-        // graphics state is bound lazily at the first draw inside the pass.
+    if (pipeline->kind == PIPELINE_GRAPHICS)
         cb->graphicsStateBound = false;
-    }
 }
 
 void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
@@ -1445,20 +1488,18 @@ static HeapArgBufs buildHeapArgBuffers(MetalDevice* md, void* heapGpu, bool want
     HeapArgBufs out;
     uint64_t heapGpuAddr = reinterpret_cast<uint64_t>(heapGpu);
 
-    // Find the CPU-accessible allocation that backs the texture heap.
-    MetalAllocation* heapAlloc = nullptr;
-    {
-        std::lock_guard lock(md->allocMutex);
-        heapAlloc = md->findByGpu(heapGpuAddr);
-    }
-    if (!heapAlloc || !heapAlloc->cpuPtr)
+    // Find the CPU-accessible allocation that backs the texture heap. Copy it
+    // by value — the pointer would dangle if another thread reallocs the
+    // allocation vector before we read cpuPtr/gpuAddr/size below.
+    MetalAllocation heapAlloc;
+    if (!md->findByGpuValue(heapGpuAddr, heapAlloc) || !heapAlloc.cpuPtr)
         return out;
     out.heapResolved = true;
 
-    size_t offset = (size_t)(heapGpuAddr - heapAlloc->gpuAddr);
+    size_t offset = (size_t)(heapGpuAddr - heapAlloc.gpuAddr);
     const auto* descs = reinterpret_cast<const GpuTextureDescriptor*>(
-        static_cast<const uint8_t*>(heapAlloc->cpuPtr) + offset);
-    NSUInteger numDescs = (NSUInteger)((heapAlloc->size - offset) / sizeof(GpuTextureDescriptor));
+        static_cast<const uint8_t*>(heapAlloc.cpuPtr) + offset);
+    NSUInteger numDescs = (NSUInteger)((heapAlloc.size - offset) / sizeof(GpuTextureDescriptor));
 
     // The lock guards the texture registry; the heap may be a suballocation
     // of a larger gpuMalloc page whose tail holds unrelated user data, so a
@@ -1533,13 +1574,23 @@ static HeapArgBufs buildHeapArgBuffers(MetalDevice* md, void* heapGpu, bool want
     return out;
 }
 
-void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
+// Shared compute prologue for gpuDispatch / gpuDispatchIndirect: (re)bind the
+// pipeline PSO if the live encoder lost it (see boundComputePipeline), bind the
+// entry-point param buffer (the GPU address of the user data struct), the
+// texture/sampler heap argument buffers, and declare residency over every live
+// allocation so device-pointer indirection works. Both dispatch flavors need
+// the identical setup; only the final dispatch call differs.
+static void bindComputeState(GpuCommandBuffer cb, id<MTLComputeCommandEncoder> enc, void* dataGpu)
 {
-    auto* md  = cb->device->metalDevice;
-    auto  enc = cb->compute();
-    auto* pl  = cb->currentPipeline;
+    auto* md = cb->device->metalDevice;
+    auto* pl = cb->currentPipeline;
 
-    // Bind the entry-point params (GPU address of the user data struct).
+    if (cb->boundComputePipeline != pl)
+    {
+        [enc setComputePipelineState:pl->pso];
+        cb->boundComputePipeline = pl;
+    }
+
     uint64_t addr = reinterpret_cast<uint64_t>(dataGpu);
     id<MTLBuffer> paramBuf = [md->device newBufferWithBytes:&addr
                                                      length:sizeof(addr)
@@ -1589,6 +1640,13 @@ void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
             [enc useResource:a.buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
     }
     [enc useResource:paramBuf usage:MTLResourceUsageRead];
+}
+
+void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
+{
+    auto  enc = cb->compute();
+    auto* pl  = cb->currentPipeline;
+    bindComputeState(cb, enc, dataGpu);
 
     MTLSize grid        = MTLSizeMake(gridDimensions.x, gridDimensions.y, gridDimensions.z);
     MTLSize threadgroup = MTLSizeMake(pl->threadgroupSize.x, pl->threadgroupSize.y, pl->threadgroupSize.z);
@@ -1599,26 +1657,23 @@ void gpuDispatchIndirect(GpuCommandBuffer cb, void* dataGpu, void* gridDimension
 {
     auto* md  = cb->device->metalDevice;
     auto  enc = cb->compute();
+    auto* pl  = cb->currentPipeline;
 
-    uint64_t dataAddr = reinterpret_cast<uint64_t>(dataGpu);
+    // Same prologue as gpuDispatch — without it a textured indirect dispatch
+    // would read unbound heap slots and the user data buffer would not be
+    // resident (the Vulkan reference treats direct and indirect identically).
+    bindComputeState(cb, enc, dataGpu);
+
     uint64_t gridAddr = reinterpret_cast<uint64_t>(gridDimensionsGpu);
-
-    id<MTLBuffer> paramBuf = [md->device newBufferWithBytes:&dataAddr
-                                                     length:sizeof(dataAddr)
-                                                    options:MTLResourceStorageModeShared];
-    [enc setBuffer:paramBuf offset:0 atIndex:cb->currentPipeline->entryParamsIndex];
-
-    {
-        std::lock_guard lock(md->allocMutex);
-        MetalAllocation* ga = md->findByGpu(gridAddr);
-        if (ga)
-            [enc dispatchThreadgroupsWithIndirectBuffer:ga->buffer
-                                  indirectBufferOffset:(NSUInteger)(gridAddr - ga->gpuAddr)
-                                 threadsPerThreadgroup:MTLSizeMake(
-                                     cb->currentPipeline->threadgroupSize.x,
-                                     cb->currentPipeline->threadgroupSize.y,
-                                     cb->currentPipeline->threadgroupSize.z)];
-    }
+    std::lock_guard lock(md->allocMutex);
+    MetalAllocation* ga = md->findByGpu(gridAddr);
+    if (ga)
+        [enc dispatchThreadgroupsWithIndirectBuffer:ga->buffer
+                              indirectBufferOffset:(NSUInteger)(gridAddr - ga->gpuAddr)
+                             threadsPerThreadgroup:MTLSizeMake(
+                                 pl->threadgroupSize.x,
+                                 pl->threadgroupSize.y,
+                                 pl->threadgroupSize.z)];
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,13 +1683,25 @@ void gpuDispatchIndirect(GpuCommandBuffer cb, void* dataGpu, void* gridDimension
 void gpuSubmit(GpuQueue /*queue*/, Span<GpuCommandBuffer> commandBuffers,
                GpuSemaphore semaphore, uint64_t value)
 {
-    for (auto gcb : commandBuffers)
+    // Commit in order; only the LAST command buffer signals `value`, so the
+    // timeline reaches it when ALL submitted work has completed (command buffers
+    // on one queue complete in commit order) rather than when the first does.
+    // This matches the Vulkan backend's single trailing signal.
+    for (size_t i = 0; i < commandBuffers.size(); ++i)
     {
+        GpuCommandBuffer gcb = commandBuffers[i];
         gcb->endAll();
-        [gcb->cb encodeSignalEvent:semaphore->event value:value];
+        if (i + 1 == commandBuffers.size())
+            [gcb->cb encodeSignalEvent:semaphore->event value:value];
         [gcb->cb commit];
         delete gcb;
     }
+
+    // An empty batch still advances the timeline (Vulkan signals even with zero
+    // command buffers); there is no GPU work to order against, so signal the
+    // shared event directly.
+    if (commandBuffers.size() == 0)
+        semaphore->event.signaledValue = value;
 }
 
 // ---------------------------------------------------------------------------
@@ -1648,7 +1715,7 @@ GpuSemaphore gpuCreateSemaphore(GpuDevice device, uint64_t initValue)
     return new GpuSemaphore_T{ ev, device };
 }
 
-void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t /*timeout*/)
+void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
 {
     if (sema->event.signaledValue >= value) return;
 
@@ -1659,7 +1726,12 @@ void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t /*timeout*/)
                           block:^(id<MTLSharedEvent>, uint64_t) {
         dispatch_semaphore_signal(dsema);
     }];
-    dispatch_semaphore_wait(dsema, DISPATCH_TIME_FOREVER);
+    // Honor a finite timeout (nanoseconds) like the Vulkan backend's
+    // vkWaitSemaphores; the default UINT64_MAX waits indefinitely.
+    dispatch_time_t deadline = timeout == UINT64_MAX
+        ? DISPATCH_TIME_FOREVER
+        : dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout);
+    dispatch_semaphore_wait(dsema, deadline);
 }
 
 void gpuDestroySemaphore(GpuSemaphore sema) { delete sema; }
@@ -1700,21 +1772,17 @@ void gpuCopyToTexture(GpuCommandBuffer cb, void* srcGpu, GpuTexture texture)
     auto* md = cb->device->metalDevice;
     uint64_t srcAddr = reinterpret_cast<uint64_t>(srcGpu);
 
-    MetalAllocation* src = nullptr;
-    {
-        std::lock_guard lock(md->allocMutex);
-        src = md->findByGpu(srcAddr);
-    }
-    if (!src) { NSLog(@"gpuCopyToTexture: src buffer not found"); return; }
+    MetalAllocation src;
+    if (!md->findByGpuValue(srcAddr, src)) { NSLog(@"gpuCopyToTexture: src buffer not found"); return; }
 
     id<MTLTexture> tex     = texture->texture;
     NSUInteger     w       = tex.width;
     NSUInteger     h       = tex.height;
     NSUInteger     bpr     = w * metalBytesPerPixel(tex.pixelFormat);
-    NSUInteger     srcOff  = (NSUInteger)(srcAddr - src->gpuAddr);
+    NSUInteger     srcOff  = (NSUInteger)(srcAddr - src.gpuAddr);
 
     auto enc = cb->blit();
-    [enc copyFromBuffer:src->buffer
+    [enc copyFromBuffer:src.buffer
           sourceOffset:srcOff
      sourceBytesPerRow:bpr
    sourceBytesPerImage:bpr * h
@@ -1730,18 +1798,14 @@ void gpuCopyFromTexture(GpuCommandBuffer cb, void* dstGpu, GpuTexture texture)
     auto* md = cb->device->metalDevice;
     uint64_t dstAddr = reinterpret_cast<uint64_t>(dstGpu);
 
-    MetalAllocation* dst = nullptr;
-    {
-        std::lock_guard lock(md->allocMutex);
-        dst = md->findByGpu(dstAddr);
-    }
-    if (!dst) { NSLog(@"gpuCopyFromTexture: dst buffer not found"); return; }
+    MetalAllocation dst;
+    if (!md->findByGpuValue(dstAddr, dst)) { NSLog(@"gpuCopyFromTexture: dst buffer not found"); return; }
 
     id<MTLTexture> tex    = texture->texture;
     NSUInteger     w      = tex.width;
     NSUInteger     h      = tex.height;
     NSUInteger     bpr    = w * metalBytesPerPixel(tex.pixelFormat);
-    NSUInteger     dstOff = (NSUInteger)(dstAddr - dst->gpuAddr);
+    NSUInteger     dstOff = (NSUInteger)(dstAddr - dst.gpuAddr);
 
     auto enc = cb->blit();
     [enc copyFromTexture:tex
@@ -1749,7 +1813,7 @@ void gpuCopyFromTexture(GpuCommandBuffer cb, void* dstGpu, GpuTexture texture)
             sourceLevel:0
            sourceOrigin:MTLOriginMake(0, 0, 0)
              sourceSize:MTLSizeMake(w, h, 1)
-               toBuffer:dst->buffer
+               toBuffer:dst.buffer
       destinationOffset:dstOff
  destinationBytesPerRow:bpr
 destinationBytesPerImage:bpr * h];
@@ -1772,16 +1836,20 @@ static constexpr const char* kBlitMSL =
 
 static id<MTLComputePipelineState> getBlitPso(MetalDevice* md)
 {
-    if (md->blitPso) return md->blitPso;
-    NSError* err = nil;
-    NSString* msl = [NSString stringWithUTF8String:kBlitMSL];
-    MTLCompileOptions* opts = [MTLCompileOptions new];
-    opts.languageVersion = MTLLanguageVersion3_1;
-    id<MTLLibrary> lib = [md->device newLibraryWithSource:msl options:opts error:&err];
-    if (!lib) { NSLog(@"getBlitPso: %@", err); return nil; }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"ngapi_blit"];
-    md->blitPso = [md->device newComputePipelineStateWithFunction:fn error:&err];
-    if (!md->blitPso) NSLog(@"getBlitPso pipeline: %@", err);
+    // call_once: two threads recording gpuBlitTexture into different command
+    // buffers may reach this concurrently (the threading contract allows it).
+    // The same guard pattern as GpuDepthStencilState_T's lazy init.
+    std::call_once(md->blitPsoOnce, [&] {
+        NSError* err = nil;
+        NSString* msl = [NSString stringWithUTF8String:kBlitMSL];
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        opts.languageVersion = MTLLanguageVersion3_1;
+        id<MTLLibrary> lib = [md->device newLibraryWithSource:msl options:opts error:&err];
+        if (!lib) { NSLog(@"getBlitPso: %@", err); return; }
+        id<MTLFunction> fn = [lib newFunctionWithName:@"ngapi_blit"];
+        md->blitPso = [md->device newComputePipelineStateWithFunction:fn error:&err];
+        if (!md->blitPso) NSLog(@"getBlitPso pipeline: %@", err);
+    });
     return md->blitPso;
 }
 
@@ -1793,6 +1861,10 @@ void gpuBlitTexture(GpuCommandBuffer cb, GpuTexture dst, GpuTexture src)
 
     auto enc = cb->compute();
     [enc setComputePipelineState:pso];
+    // This overwrote the user's compute PSO on the shared encoder; mark it lost
+    // so the next gpuDispatch re-binds currentPipeline rather than dispatching
+    // the blit kernel.
+    cb->boundComputePipeline = nullptr;
     [enc setTexture:src->texture atIndex:0];
     [enc setTexture:dst->texture atIndex:1];
     [enc useResource:src->texture usage:MTLResourceUsageRead];
@@ -1996,22 +2068,21 @@ void gpuDrawIndexedInstanced(GpuCommandBuffer cb, void* vertexDataGpu, void* pix
     auto pl  = cb->currentPipeline;
 
     // Index VA -> (MTLBuffer, offset) via the allocation registry — the Metal
-    // equivalent of the Vulkan backend's findAllocation.
+    // equivalent of the Vulkan backend's findAllocation. Copy by value: the
+    // pointer would dangle if another thread reallocs the allocation vector.
     uint64_t indexAddr = reinterpret_cast<uint64_t>(indicesGpu);
-    MetalAllocation* ia = nullptr;
-    {
-        std::lock_guard lock(md->allocMutex);
-        ia = md->findByGpu(indexAddr);
-    }
-    assert(ia && "gpuDrawIndexedInstanced: index buffer not found");
+    MetalAllocation ia;
+    bool iaFound = md->findByGpuValue(indexAddr, ia);
+    assert(iaFound && "gpuDrawIndexedInstanced: index buffer not found");
+    if (!iaFound) return;
 
     // Vulkan ref: VK_INDEX_TYPE_UINT32 with firstIndex=0, vertexOffset=0,
     // firstInstance=0 — the base 6-argument variant is exact.
     [enc drawIndexedPrimitives:pl->primitiveType
                     indexCount:indexCount
                      indexType:MTLIndexTypeUInt32
-                   indexBuffer:ia->buffer
-             indexBufferOffset:(NSUInteger)(indexAddr - ia->gpuAddr)
+                   indexBuffer:ia.buffer
+             indexBufferOffset:(NSUInteger)(indexAddr - ia.gpuAddr)
                  instanceCount:instanceCount];
 }
 
@@ -2025,15 +2096,12 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer cb, void* vertexDataGpu, v
 
     uint64_t indexAddr = reinterpret_cast<uint64_t>(indicesGpu);
     uint64_t argsAddr  = reinterpret_cast<uint64_t>(argsGpu);
-    MetalAllocation* ia = nullptr;
-    MetalAllocation* aa = nullptr;
-    {
-        std::lock_guard lock(md->allocMutex);
-        ia = md->findByGpu(indexAddr);
-        aa = md->findByGpu(argsAddr);
-    }
-    assert(ia && "gpuDrawIndexedInstancedIndirect: index buffer not found");
-    assert(aa && "gpuDrawIndexedInstancedIndirect: args buffer not found");
+    MetalAllocation ia, aa;
+    bool iaFound = md->findByGpuValue(indexAddr, ia);
+    bool aaFound = md->findByGpuValue(argsAddr, aa);
+    assert(iaFound && "gpuDrawIndexedInstancedIndirect: index buffer not found");
+    assert(aaFound && "gpuDrawIndexedInstancedIndirect: args buffer not found");
+    if (!iaFound || !aaFound) return;
 
     // MTLDrawIndexedPrimitivesIndirectArguments {indexCount, instanceCount,
     // indexStart, baseVertex, baseInstance} is field-for-field identical to
@@ -2042,10 +2110,10 @@ void gpuDrawIndexedInstancedIndirect(GpuCommandBuffer cb, void* vertexDataGpu, v
     // 4-byte offset alignment guaranteed by gpuMalloc).
     [enc drawIndexedPrimitives:pl->primitiveType
                      indexType:MTLIndexTypeUInt32
-                   indexBuffer:ia->buffer
-             indexBufferOffset:(NSUInteger)(indexAddr - ia->gpuAddr)
-                indirectBuffer:aa->buffer
-          indirectBufferOffset:(NSUInteger)(argsAddr - aa->gpuAddr)];
+                   indexBuffer:ia.buffer
+             indexBufferOffset:(NSUInteger)(indexAddr - ia.gpuAddr)
+                indirectBuffer:aa.buffer
+          indirectBufferOffset:(NSUInteger)(argsAddr - aa.gpuAddr)];
 }
 
 void gpuDrawIndexedInstancedIndirectMulti(GpuCommandBuffer, void*, uint32_t, void*, uint32_t, void*, void*, void*)
