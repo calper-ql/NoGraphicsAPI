@@ -51,7 +51,7 @@ target_include_directories(stb PUBLIC external/stb)
 set(NGAPI_WINDOW_BACKEND "GLFW" CACHE STRING "Windowing backend: GLFW or SDL3")
 set_property(CACHE NGAPI_WINDOW_BACKEND PROPERTY STRINGS GLFW SDL3)
 
-if(NGAPI_BUILD_SAMPLES)
+if(NGAPI_BUILD_SAMPLES AND NOT NGAPI_METAL_BACKEND)
 if(NGAPI_WINDOW_BACKEND STREQUAL "GLFW")
     set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
     set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -72,12 +72,13 @@ elseif(NGAPI_WINDOW_BACKEND STREQUAL "SDL3")
 else()
     message(FATAL_ERROR "NGAPI_WINDOW_BACKEND must be GLFW or SDL3 (got '${NGAPI_WINDOW_BACKEND}')")
 endif()
-endif() # NGAPI_BUILD_SAMPLES
+endif() # NGAPI_BUILD_SAMPLES AND NOT NGAPI_METAL_BACKEND
 
 # ---------------------------------------------------------------------------
-# Windowing abstraction (one backend compiled in) -- only with the samples.
+# Windowing abstraction (one backend compiled in) -- only with the samples,
+# and only when using the Vulkan backend (Metal windowing is not in the spike).
 # ---------------------------------------------------------------------------
-if(NGAPI_BUILD_SAMPLES)
+if(NGAPI_BUILD_SAMPLES AND NOT NGAPI_METAL_BACKEND)
 if(NGAPI_WINDOW_BACKEND STREQUAL "GLFW")
     add_library(ngapi-platform STATIC platform/window_glfw.cpp)
     target_link_libraries(ngapi-platform PRIVATE glfw Vulkan::Vulkan)
@@ -99,12 +100,29 @@ target_link_libraries(ngapi-samples-common
     PRIVATE stb)
 
 # ---------------------------------------------------------------------------
-# Shader compilation (slang -> SPIR-V) for the samples and tests
+# Shader compilation (slang -> SPIR-V) for the samples and tests.
+# Skipped for the Metal backend spike — Metal shaders are not compiled here yet.
 # ---------------------------------------------------------------------------
 if(NOT DEFINED VULKAN_SDK AND DEFINED ENV{VULKAN_SDK})
     set(VULKAN_SDK $ENV{VULKAN_SDK})
 endif()
-find_program(SLANGC slangc HINTS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+# Respect an explicit -DSLANGC=<path> override (documented in ngapi/README.md);
+# only search when it was not provided. find_program no-ops when SLANGC already
+# holds a valid path, so this also avoids re-resolving on every reconfigure.
+if(NOT SLANGC)
+    if(NGAPI_METAL_BACKEND)
+        # Metal shaders require slangc 2026+ for the device-pointer MSL calling
+        # convention; a PATH-installed slangc is usually newer than the one
+        # bundled in the SDK. PATHS is consulted after the system PATH, so this
+        # prefers a PATH slangc and falls back to the SDK.
+        find_program(SLANGC slangc PATHS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+    else()
+        # Vulkan/Linux path: SDK-first via HINTS (unchanged from main), so the
+        # SPIR-V the samples/tests compile is not silently retargeted to whatever
+        # slangc happens to be on PATH.
+        find_program(SLANGC slangc HINTS "${VULKAN_SDK}/Bin" "${VULKAN_SDK}/bin")
+    endif()
+endif()
 if(NOT SLANGC)
     message(FATAL_ERROR "slangc not found; set VULKAN_SDK or put slangc on PATH. "
         "(Only the samples and tests need it — consuming the ngapi/ library does not.)")
@@ -119,6 +137,70 @@ else()
     set(NGAPI_RUNTIME_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 endif()
 
+if(NGAPI_METAL_BACKEND)
+set(NGAPI_SHADER_OUTPUT_DIR  "${NGAPI_RUNTIME_DIR}/shaders")
+set(NGAPI_SHADER_INCLUDE_DIR "${NGAPI_INCLUDE_DIR}")
+include(ngapi/cmake/CompileMetalShaders.cmake)
+
+set(METAL_SHADER_DEPS
+    "${NGAPI_INCLUDE_DIR}/NoGraphicsAPI.h"
+    "${NGAPI_INCLUDE_DIR}/Config.h"
+    "${NGAPI_INCLUDE_DIR}/Sampler.h")
+
+set(NGAPI_METAL_SHADER_OUTPUTS "")
+# Tensor kernels carry per-entry threadgroup sizes. The Metal backend reads the
+# size from the "// NGAPI_THREADS" comment (no max_total_threads attribute is
+# emitted), defaulting to {64,1,1} when absent — so the two single-thread
+# kernels MUST get an explicit "1 1 1" or they would launch 64 threads and run
+# 64x redundant (and on a non-idempotent kernel, wrong) work versus Vulkan.
+compile_metal_shader(SOURCE samples/learning/Tensor.slang STAGE compute
+    OUTPUT learning/Tensor.metal
+    ENTRY _add _sub _mul _div _matmul _pow _tanh
+    NUMTHREADS "64 1 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
+compile_metal_shader(SOURCE samples/learning/Tensor.slang STAGE compute
+    OUTPUT learning/Tensor.metal
+    ENTRY _dot _mT
+    NUMTHREADS "1 1 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
+
+compile_metal_shader(SOURCE samples/compute/Compute.slang STAGE compute
+    OUTPUT compute/Compute.metal
+    ENTRY main
+    NUMTHREADS "16 16 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/compute/Compute.h")
+
+compile_metal_shader(SOURCE samples/graphics/Vertex.slang STAGE vertex
+    OUTPUT graphics/Vertex.metal
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/graphics/Graphics.h")
+
+compile_metal_shader(SOURCE samples/graphics/Pixel.slang STAGE fragment
+    OUTPUT graphics/Pixel.metal
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/graphics/Graphics.h")
+
+compile_metal_shader(SOURCE samples/common/TAA.slang STAGE compute
+    OUTPUT common/TAA.metal
+    NUMTHREADS "16 16 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/common/TAA.h")
+
+compile_metal_shader(SOURCE samples/multithreading/Multithreading.slang STAGE compute
+    OUTPUT multithreading/Multithreading.metal
+    NUMTHREADS "64 1 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/multithreading/Multithreading.h")
+
+# All five bench entry points from one .slang; multi-entry compilation emits
+# one file per entry (SamplerBench_<entry>.metal) so every kernel keeps
+# EntryPointParams at [[buffer(0)]].
+compile_metal_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute
+    OUTPUT samplerbench/SamplerBench.metal
+    ENTRY benchHardware benchStatic benchInline benchStaticNearest benchManualNearest
+    NUMTHREADS "16 16 1"
+    EXTRA_DEPENDS ${METAL_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+
+add_custom_target(metal_shaders ALL DEPENDS ${NGAPI_METAL_SHADER_OUTPUTS})
+endif() # NGAPI_METAL_BACKEND
+
+if(NOT NGAPI_METAL_BACKEND)
 set(NGAPI_SHADER_OUTPUT_DIR  "${NGAPI_RUNTIME_DIR}/shaders")
 set(NGAPI_SHADER_INCLUDE_DIR "${NGAPI_INCLUDE_DIR}")
 include(ngapi/cmake/CompileShaders.cmake)
@@ -155,10 +237,14 @@ compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT ra
 compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT raytracing/Shade.spv ENTRY Shade
     EXTRA_DEPENDS ${RT_SHADER_DEPS})
 
-compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchHW.spv ENTRY benchHardware
+# All bench entry points in one module (one slangc invocation); the harness
+# picks entries at pipeline creation.
+compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/Bench.spv
+    ENTRY benchHardware benchStatic benchInline benchStaticNearest benchManualNearest
     EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
-compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTPUT samplerbench/BenchSW.spv ENTRY benchSoftware
-    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/samplerbench/SamplerBench.h")
+
+compile_shader(SOURCE samples/multithreading/Multithreading.slang STAGE compute OUTPUT multithreading/Multithreading.spv
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/multithreading/Multithreading.h")
 
 # The learning sample's tensor ops are nine compute entry points in one .slang;
 # compile them all into a single Tensor.spv (Device_impl builds a pipeline per
@@ -176,10 +262,12 @@ add_custom_target(ngapi-embed-patch-descriptors
     COMMAND ${CMAKE_COMMAND} -DSLANGC=${SLANGC}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/ngapi/cmake/EmbedPatchDescriptors.cmake"
     COMMENT "Re-embedding PatchDescriptors.slang into ngapi/src/PatchDescriptorsSpv.h")
+endif() # NOT NGAPI_METAL_BACKEND
 
 # Copy assets next to the executables (samples load these from the run dir; the
 # tests read assets straight from the source tree, so this is samples-only).
 if(NGAPI_BUILD_SAMPLES)
+if(NOT NGAPI_METAL_BACKEND)
 add_custom_target(copy_assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${NGAPI_RUNTIME_DIR}/assets"
@@ -198,16 +286,72 @@ endfunction()
 add_windowed_sample(compute    samples/compute/Compute.cpp)
 add_windowed_sample(graphics   samples/graphics/Graphics.cpp)
 add_windowed_sample(raytracing samples/raytracing/Raytracing.cpp)
+endif() # NOT NGAPI_METAL_BACKEND
 
 # Headless sample: no window, no shaders/assets.
 add_executable(multiplegpus samples/multiplegpus/MultipleGPUs.cpp)
 target_link_libraries(multiplegpus PRIVATE ngapi::ngapi)
+
+if(NOT NGAPI_METAL_BACKEND)
+# Scratch sampler regression benchmark (run from build/bin).
+add_executable(samplerbench samples/samplerbench/SamplerBench.cpp)
+target_link_libraries(samplerbench PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(samplerbench shaders)
+
+# Headless multithreading demo/self-test (run from build/bin).
+add_executable(multithreading samples/multithreading/Multithreading.cpp)
+target_link_libraries(multithreading PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(multithreading shaders)
 
 # Headless sample that runs compute shaders (a tiny tensor/MLP library): no
 # window, but it loads the compiled Tensor.spv at runtime.
 add_executable(learning samples/learning/Learning.cpp samples/learning/Tensor.cpp)
 target_link_libraries(learning PRIVATE ngapi::ngapi ngapi-samples-common glm::glm)
 add_dependencies(learning shaders)
+endif() # NOT NGAPI_METAL_BACKEND
+
+if(NGAPI_METAL_BACKEND)
+add_executable(learning samples/learning/Learning.cpp samples/learning/Tensor.cpp)
+target_link_libraries(learning PRIVATE ngapi::ngapi ngapi-samples-common glm::glm)
+add_dependencies(learning metal_shaders)
+
+add_custom_target(copy_assets_metal ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${NGAPI_RUNTIME_DIR}/assets"
+    COMMENT "Copying assets (Metal)")
+
+# Windowing for Metal samples: Cocoa + CAMetalLayer (no GLFW or SDL3).
+add_library(ngapi-platform-metal STATIC platform/window_metal.mm)
+target_include_directories(ngapi-platform-metal PUBLIC platform)
+target_link_libraries(ngapi-platform-metal PUBLIC ngapi::ngapi)
+target_link_libraries(ngapi-platform-metal PUBLIC
+    "-framework Cocoa" "-framework Metal" "-framework QuartzCore")
+
+add_executable(compute samples/compute/Compute.cpp)
+target_compile_definitions(compute PRIVATE GPU_METAL_BACKEND)
+target_link_libraries(compute PRIVATE
+    ngapi::ngapi ngapi-platform-metal ngapi-samples-common stb glm::glm)
+add_dependencies(compute metal_shaders copy_assets_metal)
+
+# Windowed graphics sample (rasterization + TAA). GPU_METAL_BACKEND comes in
+# as a PUBLIC compile definition on ngapi::ngapi.
+add_executable(graphics samples/graphics/Graphics.cpp)
+target_link_libraries(graphics PRIVATE
+    ngapi::ngapi ngapi-platform-metal ngapi-samples-common stb glm::glm)
+add_dependencies(graphics metal_shaders copy_assets_metal)
+
+# Headless multithreading demo/self-test (run from build/bin). GPU_METAL_BACKEND
+# comes in as a PUBLIC compile definition on ngapi::ngapi.
+add_executable(multithreading samples/multithreading/Multithreading.cpp)
+target_link_libraries(multithreading PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(multithreading metal_shaders)
+
+# Scratch sampler regression benchmark (run from build/bin).
+add_executable(samplerbench samples/samplerbench/SamplerBench.cpp)
+target_link_libraries(samplerbench PRIVATE ngapi::ngapi ngapi-samples-common)
+add_dependencies(samplerbench metal_shaders)
+endif() # NGAPI_METAL_BACKEND
+
 endif() # NGA_BUILD_SAMPLES
 
 # ---------------------------------------------------------------------------

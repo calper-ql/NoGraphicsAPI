@@ -2,3 +2,4 @@ build/
 build-*/
 .vs/
 CMakeUserPresets.json*.swp
+__pycache__/

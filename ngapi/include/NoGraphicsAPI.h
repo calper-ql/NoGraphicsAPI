@@ -9,6 +9,7 @@
 
 #else
 #define alignas(x) // do nothing in shader
+#define NGAPI_ASSERT_GPU_STRUCT(T, expected_size) // C++-side check; no-op in shaders
 
 #define AccelerationStructure uint64_t
 
@@ -17,9 +18,6 @@ Texture2D<float4> textureHeap[];
 
 [[vk::binding(0, 1)]]
 RWTexture2D<float4> rwTextureHeap[];
-
-[[vk::binding(0, 2)]]
-SamplerState samplerHeap[];
 
 #endif
 

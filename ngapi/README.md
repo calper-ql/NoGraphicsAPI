@@ -103,6 +103,83 @@ add_custom_target(my_shaders ALL DEPENDS ${NGAPI_SHADER_OUTPUTS})
 `slangc` is picked up from `PATH` or the `VULKAN_SDK` environment variable;
 pass `-DSLANGC=/path/to/slangc` to override.
 
+## Shared CPU/GPU struct layout rules
+
+Structs passed to shaders via device-buffer pointers must have identical layout
+on the CPU (C++) and on every GPU target. The two compilers disagree in
+opposite directions, so both rules below are needed:
+
+1. **Never use `float3` (or `uint3`/`int3`) as a field in a device-buffer
+   struct.** Metal MSL gives 3-component vectors 16-byte alignment inside
+   structs, effectively padding them to 16 bytes, while the C++ `float3` is
+   12 bytes — every field that follows sits at a different offset on each
+   side. Use `float4` with `w = 0.0` and access `.rgb` / `.xyz` in the shader.
+   (Bare `float3*` pointers to tightly packed arrays are fine: the Metal
+   shader toolchain rewrites those to `packed_float3*`.)
+
+2. **Explicitly pad the struct to a multiple of 16 bytes if it is read as an
+   array.** Slang's SPIR-V "natural" layout packs fields tightly and does NOT
+   round the array stride up to the largest member's alignment:
+   `{ float4; float }` has stride 20 in SPIR-V but 32 in MSL and in C++ with
+   `alignas(16)`. Add explicit `float _pad...;` members so the packed field
+   sum equals the C++ `sizeof` — then all three layouts agree. For the same
+   reason, keep every `float4` field at an offset that is a multiple of 16.
+
+Use `NGAPI_ASSERT_GPU_STRUCT` to pin the agreed size at compile time (defined
+in `NoGraphicsAPI_Impl.h` for C++, a no-op when the header is compiled as
+shader code):
+
+```cpp
+struct alignas(16) MyData
+{
+    float4 color;                // rule 1: NOT float3
+    float  value;
+    float  _pad0, _pad1, _pad2;  // rule 2: explicit tail padding to 32
+};
+NGAPI_ASSERT_GPU_STRUCT(MyData, 32);
+```
+
+The assert fires immediately if the C++ size deviates from the declared one,
+making layout drift a compile error rather than a silent corruption. The
+compute sample's `Tint` struct (`samples/compute/Compute.h`) is the worked
+example: with `float3 color` it broke Metal (stride 16 vs 32), with an
+unpadded `float4` it broke Vulkan (stride 32 vs 20) — the committed form is
+the one whose stride all targets agree on.
+
+## Metal backend (macOS)
+
+Configure with `-DNGAPI_METAL_BACKEND=ON` (or the repo's `macos-metal`
+preset) to build the native Metal backend instead of Vulkan. Shaders are
+compiled to MSL with `slangc -target metal`, post-processed by
+`cmake/RewriteMetalHeaps.py` (see `cmake/CompileMetalShaders.cmake`), and
+compiled by the Metal runtime at pipeline creation.
+
+Supported: compute pipelines and dispatch (direct + indirect), bindless
+texture/sampler heaps, inline and static samplers, render passes, graphics
+pipelines, indexed and indirect draws, depth test/write/bias, blend state via
+`GpuRasterDesc`, swapchain presentation (CAMetalLayer), texture upload/
+readback/blit, timeline semaphores, and the multithreaded recording contract.
+Every sample and headless golden-image test runs on it except `raytracing`.
+
+Not supported (asserts loudly rather than misbehaving):
+
+- **Ray tracing** — Slang rejects the bindless
+  `RaytracingAccelerationStructure(uint64)` idiom for `-target metal`, and
+  Metal acceleration structures cannot be placed inside an `MTLBuffer`, so the
+  `gpuMalloc` placement contract needs an API-level decision first. Scoped to
+  a later phase.
+- Multi-draw (`gpuDrawIndexedInstancedIndirectMulti`), meshlet draws, and
+  stencil — nothing in the repo exercises them.
+- `gpuSetBlendState`, `gpuSignalAfter`, `gpuWaitBefore` are no-ops, matching
+  the Vulkan reference where they are also TODO.
+
+Behavioral notes: sampler LOD bias is ignored (Metal samplers have none);
+sampler-heap slot 0 is the device default sampler on both backends; the
+rendered image orientation matches Vulkan exactly (the backend uses a
+negative-height viewport internally). The friction log at the top of
+`src/NoGraphicsAPI_Metal.mm` documents every Vulkan/Metal divergence in
+detail.
+
 ## Developing NGAPI itself
 
 `src/PatchDescriptorsSpv.h` is generated from `shaders/PatchDescriptors.slang`

@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "Tensor.h"
 #include "Utilities.h"
+#include <cstring>
 #include <map>
 #include <algorithm>
 #include <random>
@@ -39,16 +40,34 @@ public:
         queue = gpuCreateQueue(device);
         allocator = new LinearAllocator<MEMORY_DEFAULT>(device);
 
+#ifdef GPU_METAL_BACKEND
+        // Metal: each entry point compiled to its own .metal file so that
+        // EntryPointParams is always at [[buffer(0)]] in every kernel.
+        auto loadEntry = [&](const char* op) {
+            auto ir = loadIR(std::string("shaders/learning/Tensor_") + op + ".metal");
+            return gpuCreateComputePipeline(device, ByteSpan(ir), (std::string("_") + op).c_str());
+        };
+        pipelines["add"]    = loadEntry("add");
+        pipelines["sub"]    = loadEntry("sub");
+        pipelines["mul"]    = loadEntry("mul");
+        pipelines["div"]    = loadEntry("div");
+        pipelines["dot"]    = loadEntry("dot");
+        pipelines["mT"]     = loadEntry("mT");
+        pipelines["matmul"] = loadEntry("matmul");
+        pipelines["pow"]    = loadEntry("pow");
+        pipelines["tanh"]   = loadEntry("tanh");
+#else
         auto tensorIR = loadIR("shaders/learning/Tensor.spv");
-        pipelines["add"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_add");
-        pipelines["sub"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_sub");
-        pipelines["mul"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_mul");
-        pipelines["div"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_div");
-        pipelines["dot"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_dot");
-        pipelines["mT"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_mT");
+        pipelines["add"]    = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_add");
+        pipelines["sub"]    = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_sub");
+        pipelines["mul"]    = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_mul");
+        pipelines["div"]    = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_div");
+        pipelines["dot"]    = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_dot");
+        pipelines["mT"]     = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_mT");
         pipelines["matmul"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_matmul");
-        pipelines["pow"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_pow");
-        pipelines["tanh"] = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_tanh");
+        pipelines["pow"]    = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_pow");
+        pipelines["tanh"]   = gpuCreateComputePipeline(device, ByteSpan(tensorIR), "_tanh");
+#endif
     }
 
     ~Device_impl()
@@ -165,7 +184,7 @@ public:
         {
             semaphore = gpuCreateSemaphore(device, 0);
         }
-        gpuSubmit(queue, Span(&cmd, 1), semaphore, frame);
+        gpuSubmit(queue, Span<GpuCommandBuffer>(&cmd, 1), semaphore, frame);
         cmd = nullptr;
         gpuWaitSemaphore(semaphore, frame++);
         for (auto& allocation : pending_free)

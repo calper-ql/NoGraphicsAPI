@@ -134,8 +134,13 @@ int main()
         .colorTargets = Span<ColorTarget>(colorTargets, 2)
     };
 
+#ifdef GPU_METAL_BACKEND
+    auto vertexIR = loadIR("shaders/graphics/Vertex.metal");
+    auto pixelIR = loadIR("shaders/graphics/Pixel.metal");
+#else
     auto vertexIR = loadIR("shaders/graphics/Vertex.spv");
     auto pixelIR = loadIR("shaders/graphics/Pixel.spv");
+#endif
     auto pipeline = gpuCreateGraphicsPipeline(
         device,
         ByteSpan(vertexIR),
@@ -148,7 +153,11 @@ int main()
     };
     GpuDepthStencilState depthState = gpuCreateDepthStencilState(depthDescState);
 
+#ifdef GPU_METAL_BACKEND
+    auto taaIR = loadIR("shaders/common/TAA.metal");
+#else
     auto taaIR = loadIR("shaders/common/TAA.spv");
+#endif
     auto taaPipeline = gpuCreateComputePipeline(
         device,
         ByteSpan(taaIR));

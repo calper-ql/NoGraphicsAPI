@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 
 namespace ngapi
 {
@@ -16,6 +17,11 @@ namespace ngapi
         bool closeRequested = false;
         std::array<bool, static_cast<size_t>(Key::Count)> down{};
         std::array<bool, static_cast<size_t>(Key::Count)> pressed{};
+
+        // NGAPI_MAX_FRAMES env var: request close after N pollEvents calls
+        // (headless/CI runs of the windowed samples). -1 = no cap.
+        long maxFrames  = -1;
+        long frameCount = 0;
     };
 
     static int toKeyIndex(SDL_Keycode key)
@@ -52,6 +58,10 @@ namespace ngapi
         SDL_Init(SDL_INIT_VIDEO);
         Window* window = new Window();
         window->handle = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN);
+        if (const char* s = getenv("NGAPI_MAX_FRAMES"))
+        {
+            window->maxFrames = atol(s);
+        }
         return window;
     }
 
@@ -113,6 +123,11 @@ namespace ngapi
                     window->down[i] = false;
                 }
             }
+        }
+
+        if (window->maxFrames >= 0 && ++window->frameCount >= window->maxFrames)
+        {
+            window->closeRequested = true;
         }
     }
 

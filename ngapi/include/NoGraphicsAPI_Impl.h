@@ -47,6 +47,14 @@ struct float2
 {
     float x, y;
 };
+// WARNING: do NOT use float3 as a field in any struct shared with GPU device
+// buffers. Metal MSL gives float3 16-byte alignment inside structs, padding
+// it to 16 bytes, while this C++ float3 is 12 bytes — sizeof and field offsets
+// diverge, silently corrupting data past the first field. Use float4 with the
+// unused w component set to 0, and pad the struct to a 16-byte multiple with
+// explicit float fields (Slang's SPIR-V layout packs tightly and does not
+// round the array stride up). Full rules: "Shared CPU/GPU struct layout
+// rules" in ngapi/README.md.
 struct float3
 {
     float x, y, z;
@@ -63,6 +71,26 @@ struct float4x4
 {
     float4 row0, row1, row2, row3;
 };
+
+// Verify that a struct shared between CPU and a GPU device buffer has the size
+// you expect. Place this immediately after the struct's closing brace.
+//
+//   struct alignas(16) MyData
+//   {
+//       float4 color;
+//       float  value;
+//       float  _pad0, _pad1, _pad2;  // explicit tail padding to 32
+//   };
+//   NGAPI_ASSERT_GPU_STRUCT(MyData, 32);
+//
+// The assert fires if the size drifts — most commonly because someone replaced
+// a float4 field with float3, or dropped the explicit padding that keeps the
+// SPIR-V array stride equal to sizeof (see warning above and ngapi/README.md).
+#define NGAPI_ASSERT_GPU_STRUCT(T, expected_size)                               \
+    static_assert(sizeof(T) == (expected_size),                                 \
+        #T ": unexpected size for a GPU device-buffer struct. "                 \
+           "Use float4 (not float3) and pad to a 16-byte multiple; see "        \
+           "the layout rules in ngapi/README.md.")
 
 // Use standard library span
 template <typename T>
@@ -454,6 +482,15 @@ void gpuFreeDepthStencilState(GpuDepthStencilState state);
 void gpuFreeBlendState(GpuBlendState state);
 
 // Queue
+//
+// Threading contract: resource creation/destruction (malloc/free, textures,
+// view descriptors, pipelines, semaphores, acceleration structures) and
+// queue operations (submit, wait, present) are callable from any thread
+// concurrently. Command recording is parallel across command buffers — each
+// GpuCommandBuffer belongs to one thread at a time and recording into it
+// takes no locks. Externally synchronized (one thread at a time): each
+// individual command buffer, each swapchain, and instance/device
+// creation/destruction. See docs/multithreading.md.
 GpuQueue gpuCreateQueue(GpuDevice device);
 void gpuDestroyQueue(GpuQueue queue);
 GpuCommandBuffer gpuStartCommandRecording(GpuQueue queue);
