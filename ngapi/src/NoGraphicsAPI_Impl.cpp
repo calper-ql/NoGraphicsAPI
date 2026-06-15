@@ -1271,9 +1271,24 @@ GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* ptrGpu)
     // away with a one-shot submit. Leaving it UNDEFINED until first use causes a
     // GPU hang on drivers that honour layouts (RADV); since this only runs at
     // resource-creation time the synchronous submit is acceptable.
+    //
+    // gpuCreateTexture is callable from any thread, so the one-shot must not
+    // touch externally-synchronized shared state unguarded: it uses its own
+    // transient command pool (the device pool would be raced by a concurrent
+    // gpuCreateTexture), and the submit + wait run under submitMutex (the
+    // graphics VkQueue is externally synchronized and shared with gpuSubmit /
+    // gpuPresent). The wait briefly stalls the queue, acceptable at creation.
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.queueFamilyIndex = vulkanDevice->graphicsQueueFamily;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    vulkanDevice->dispatchTable.createCommandPool(&poolInfo, nullptr, &pool);
+
     VkCommandBufferAllocateInfo allocInfo = {};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = vulkanDevice->commandPool;
+    allocInfo.commandPool = pool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
 
@@ -1295,10 +1310,13 @@ GpuTexture gpuCreateTexture(GpuDevice device, GpuTextureDesc desc, void* ptrGpu)
     submitInfo.pCommandBuffers = &cmd;
 
     VkQueue queue = vulkanDevice->device.get_queue(vkb::QueueType::graphics).value();
-    vulkanDevice->dispatchTable.queueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vulkanDevice->dispatchTable.queueWaitIdle(queue);
+    {
+        std::lock_guard lock(vulkanDevice->submitMutex);
+        vulkanDevice->dispatchTable.queueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vulkanDevice->dispatchTable.queueWaitIdle(queue);
+    }
 
-    vulkanDevice->dispatchTable.freeCommandBuffers(vulkanDevice->commandPool, 1, &cmd);
+    vulkanDevice->dispatchTable.destroyCommandPool(pool, nullptr);
 
     return texture;
 }
