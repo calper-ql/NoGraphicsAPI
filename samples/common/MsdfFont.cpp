@@ -52,13 +52,18 @@ namespace
             return nullptr;
         }
 
-        double num(double fallback = 0.0) const { return type == Type::Number ? number : fallback; }
+        double num(double fallback = 0.0) const
+        {
+            return type == Type::Number ? number : fallback;
+        }
     };
 
     class JsonParser
     {
     public:
-        explicit JsonParser(const std::string& text) : p(text.data()), end(text.data() + text.size()) {}
+        explicit JsonParser(const std::string& text) : p(text.data()), end(text.data() + text.size())
+        {
+        }
 
         JsonValue parse()
         {
@@ -67,7 +72,10 @@ namespace
             return v;
         }
 
-        bool ok() const { return good; }
+        bool ok() const
+        {
+            return good;
+        }
 
     private:
         const char* p;
@@ -129,14 +137,30 @@ namespace
                     }
                     switch (*p)
                     {
-                    case 'n': out += '\n'; break;
-                    case 't': out += '\t'; break;
-                    case 'r': out += '\r'; break;
-                    case 'b': out += '\b'; break;
-                    case 'f': out += '\f'; break;
-                    case '"': out += '"'; break;
-                    case '\\': out += '\\'; break;
-                    case '/': out += '/'; break;
+                    case 'n':
+                        out += '\n';
+                        break;
+                    case 't':
+                        out += '\t';
+                        break;
+                    case 'r':
+                        out += '\r';
+                        break;
+                    case 'b':
+                        out += '\b';
+                        break;
+                    case 'f':
+                        out += '\f';
+                        break;
+                    case '"':
+                        out += '"';
+                        break;
+                    case '\\':
+                        out += '\\';
+                        break;
+                    case '/':
+                        out += '/';
+                        break;
                     case 'u':
                         // Not needed by the msdf metrics; skip the 4 hex digits.
                         for (int i = 0; i < 4 && p + 1 < end; i++)
@@ -145,7 +169,9 @@ namespace
                         }
                         out += '?';
                         break;
-                    default: out += *p; break;
+                    default:
+                        out += *p;
+                        break;
                     }
                     p++;
                 }
@@ -478,9 +504,18 @@ const MsdfFont::Glyph* MsdfFont::glyph(uint32_t codepoint) const
     return it == glyphs.end() ? nullptr : &it->second;
 }
 
-float MsdfFont::lineHeight(float pixelSize) const { return metricsLineHeight * pixelSize; }
-float MsdfFont::ascent(float pixelSize) const { return metricsAscender * pixelSize; }
-float MsdfFont::descent(float pixelSize) const { return -metricsDescender * pixelSize; }
+float MsdfFont::lineHeight(float pixelSize) const
+{
+    return metricsLineHeight * pixelSize;
+}
+float MsdfFont::ascent(float pixelSize) const
+{
+    return metricsAscender * pixelSize;
+}
+float MsdfFont::descent(float pixelSize) const
+{
+    return -metricsDescender * pixelSize;
+}
 
 float2 MsdfFont::measure(std::string_view utf8, float pixelSize, float letterSpacing) const
 {
@@ -546,7 +581,7 @@ MsdfTextRenderer::MsdfTextRenderer(GpuDevice gpuDevice, FORMAT colorTargetFormat
     // dynamic pipeline state, so a disabled state must be bound before drawing.
     depthStencilState = gpuCreateDepthStencilState(GpuDepthStencilDesc{});
 
-    heapAlloc = gpuMalloc(device, sizeof(GpuTextureDescriptor) * heapCapacity);
+    heapAlloc = gpuMalloc(device, sizeof(GpuTextureDescriptor) * heapCapacity, MEMORY_DESCRIPTOR);
     heapCpu = static_cast<GpuTextureDescriptor*>(heapAlloc);
     heapGpu = gpuHostToDevicePointer(device, heapAlloc);
 

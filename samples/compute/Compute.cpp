@@ -131,6 +131,7 @@ int main()
     stbi_image_free(inputImage);
 
     allocator.reset();
+    descriptorAllocator.reset();
 
     gpuDestroySemaphore(semaphore);
     gpuDestroyTexture(texture);

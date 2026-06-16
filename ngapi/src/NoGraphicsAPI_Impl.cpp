@@ -338,6 +338,7 @@ struct Allocation
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
     void* ptr = nullptr;
+    VkBufferUsageFlags usage = 0;
 };
 
 struct VulkanInstance
@@ -752,7 +753,7 @@ struct VulkanDevice
 
     Allocation createAllocation(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkDeviceSize alignment)
     {
-        Allocation alloc = { .size = size };
+        Allocation alloc = { .size = size, .usage = usage };
 
         VkBufferCreateInfo bufferInfo = {};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -1123,6 +1124,11 @@ void* gpuMallocHidden(VulkanDevice* vulkanDevice, size_t bytes, size_t align, ME
         else if (memory == MEMORY_DESCRIPTOR)
         {
             usage |= VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
+        }
+
+        if (sampler || memory == MEMORY_DESCRIPTOR)
+        {
+            align = std::max<size_t>(align, vulkanDevice->descriptorBufferProperties.descriptorBufferOffsetAlignment);
         }
 
         auto properties =
@@ -2219,6 +2225,21 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
         rwAddress = reinterpret_cast<VkDeviceAddress>(rwPatchedDescriptorDataGpu);
 
         gpuSetPipeline(cb, currentPipeline);
+    }
+    else
+    {
+        // Direct-bind path: the user's heap is bound as a Vulkan descriptor
+        // buffer, so it must have been allocated with descriptor-buffer usage and
+        // alignment (i.e. with MEMORY_DESCRIPTOR). A plain MEMORY_DEFAULT heap
+        // mis-derives the descriptor-buffer base address and causes a GPUVM fault
+        // / device-lost with no validation message. MEMORY_DESCRIPTOR guarantees
+        // both the usage bit and descriptorBufferOffsetAlignment.
+        assert((alloc.usage & VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT) &&
+               "texture heap passed to gpuSetActiveTextureHeapPtr was not allocated "
+               "with MEMORY_DESCRIPTOR");
+        assert((address % vulkanDevice->descriptorBufferProperties.descriptorBufferOffsetAlignment) == 0 &&
+               "texture heap address does not meet descriptorBufferOffsetAlignment "
+               "(allocate with MEMORY_DESCRIPTOR)");
     }
 
     VkDescriptorBufferBindingInfoEXT bufferBindingInfo[3] = {};

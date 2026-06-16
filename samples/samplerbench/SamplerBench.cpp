@@ -210,6 +210,7 @@ int main()
     } // timer scope
 
     allocator.reset();
+    descriptorAllocator.reset();
     gpuDestroyTexture(srcTexture);
     gpuDestroyTexture(dstTexture);
     gpuFree(device, srcPtr);
