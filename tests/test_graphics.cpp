@@ -38,7 +38,6 @@ int main(int argc, char** argv)
     const uint32_t RENDER_H = 240;
 
     LinearAllocator allocator(device);
-    LinearAllocator<MEMORY_DESCRIPTOR> descriptorAllocator(device);
 
     int width, height, channels;
     const std::string inputPath = std::string(NGAPI_TEST_ASSET_DIR) + "/Default.png";
@@ -96,7 +95,7 @@ int main(int argc, char** argv)
         INDEX_TAA_OUTPUT = 5,
     };
 
-    auto textureHeap = descriptorAllocator.allocate<GpuTextureDescriptor>(1024);
+    auto textureHeap = gpuAllocTextureHeap(device, 1024);
     textureHeap.cpu[INDEX_CUBE] = gpuTextureViewDescriptor(texture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
     textureHeap.cpu[INDEX_CURRENT_FRAME] = gpuTextureViewDescriptor(rasterOutput, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
     textureHeap.cpu[INDEX_HISTORY] = gpuTextureViewDescriptor(historyTexture, GpuViewDesc{ .format = FORMAT_RGBA8_UNORM });
@@ -264,7 +263,7 @@ int main(int argc, char** argv)
     int rc = test::finalize(args, "graphics", actual);
 
     allocator.reset();
-    descriptorAllocator.reset();
+    gpuFreeTextureHeap(device, textureHeap);
     stbi_image_free(inputImage);
     gpuDestroyTexture(texture);
     gpuFree(device, texturePtr);

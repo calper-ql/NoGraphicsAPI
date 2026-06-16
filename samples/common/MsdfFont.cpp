@@ -546,9 +546,7 @@ MsdfTextRenderer::MsdfTextRenderer(GpuDevice gpuDevice, FORMAT colorTargetFormat
     // dynamic pipeline state, so a disabled state must be bound before drawing.
     depthStencilState = gpuCreateDepthStencilState(GpuDepthStencilDesc{});
 
-    heapAlloc = gpuMalloc(device, sizeof(GpuTextureDescriptor) * heapCapacity);
-    heapCpu = static_cast<GpuTextureDescriptor*>(heapAlloc);
-    heapGpu = gpuHostToDevicePointer(device, heapAlloc);
+    heap = gpuAllocTextureHeap(device, heapCapacity);
 
     instAlloc = gpuMalloc(device, sizeof(MsdfGlyphInstance) * maxGlyphs);
     instancesCpu = static_cast<MsdfGlyphInstance*>(instAlloc);
@@ -581,7 +579,7 @@ MsdfTextRenderer::~MsdfTextRenderer()
     {
         gpuFreeDepthStencilState(depthStencilState);
     }
-    gpuFree(device, heapAlloc);
+    gpuFreeTextureHeap(device, heap);
     gpuFree(device, instAlloc);
     gpuFree(device, vertexAlloc);
     gpuFree(device, pixelAlloc);
@@ -591,7 +589,7 @@ MsdfTextRenderer::~MsdfTextRenderer()
 MsdfFont* MsdfTextRenderer::loadFont(const std::string& jsonPath, const std::string& pngPath)
 {
     uint32_t slot = nextHeapSlot++;
-    fonts.push_back(std::make_unique<MsdfFont>(device, jsonPath, pngPath, heapCpu, slot));
+    fonts.push_back(std::make_unique<MsdfFont>(device, jsonPath, pngPath, heap.cpu, slot));
     return fonts.back().get();
 }
 
@@ -681,7 +679,7 @@ void MsdfTextRenderer::render(GpuCommandBuffer cmd, GpuTexture target, uint32_t 
 
     gpuSetPipeline(cmd, pipeline);
     gpuSetDepthStencilState(cmd, depthStencilState);
-    gpuSetActiveTextureHeapPtr(cmd, heapGpu);
+    gpuSetActiveTextureHeapPtr(cmd, heap.gpu);
     gpuBeginRenderPass(cmd, renderPassDesc);
     if (count > 0)
     {

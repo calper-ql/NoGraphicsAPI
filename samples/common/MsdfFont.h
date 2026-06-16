@@ -131,10 +131,10 @@ private:
     GpuPipeline pipeline = nullptr;
     GpuDepthStencilState depthStencilState = nullptr;
 
-    // Texture heap holding the atlas descriptors.
-    void* heapAlloc = nullptr;
-    GpuTextureDescriptor* heapCpu = nullptr;
-    void* heapGpu = nullptr;
+    // Texture heap holding the atlas descriptors. Allocated via
+    // gpuAllocTextureHeap so it satisfies the descriptor-buffer usage and
+    // alignment that gpuSetActiveTextureHeapPtr requires on direct-bind devices.
+    GpuTextureHeap heap = {};
     uint32_t heapCapacity = 0;
     uint32_t nextHeapSlot = 0;
 

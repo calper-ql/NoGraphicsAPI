@@ -639,13 +639,12 @@ public:
 
 private:
     LinearAllocator<MEMORY_DEFAULT>* allocator = nullptr;
-    LinearAllocator<MEMORY_DESCRIPTOR>* descriptorAllocator = nullptr;
 
     GpuDevice device;
     GpuPipeline pipeline;
     GpuDepthStencilState depthStencilState = nullptr;
 
-    Allocation<GpuTextureDescriptor> textureHeap;
+    GpuTextureHeap textureHeap = {};
     Allocation<TextVertexData> vertexData;
     Allocation<TextPixelData> pixelData;
     Allocation<uint32_t> indexData;

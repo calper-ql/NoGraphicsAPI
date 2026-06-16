@@ -30,12 +30,11 @@ int main(int argc, char** argv)
     auto queue = gpuCreateQueue(device);
     auto semaphore = gpuCreateSemaphore(device, 0);
     LinearAllocator allocator(device);
-    LinearAllocator<MEMORY_DESCRIPTOR> descriptorAllocator(device);
 
     auto computeIR = loadIR(std::string(NGAPI_TEST_SHADER_DIR) + "/compute/Compute.spv");
     auto pipeline = gpuCreateComputePipeline(device, ByteSpan(computeIR.data(), computeIR.size()));
 
-    auto textureHeap = descriptorAllocator.allocate<GpuTextureDescriptor>(1024);
+    auto textureHeap = gpuAllocTextureHeap(device, 1024);
 
     int width, height, channels;
     const std::string inputPath = std::string(NGAPI_TEST_ASSET_DIR) + "/Default.png";
@@ -121,7 +120,7 @@ int main(int argc, char** argv)
 
     stbi_image_free(inputImage);
     allocator.reset();
-    descriptorAllocator.reset();
+    gpuFreeTextureHeap(device, textureHeap);
     gpuDestroySemaphore(semaphore);
     gpuDestroyTexture(texture);
     gpuDestroyTexture(outputTexture);
