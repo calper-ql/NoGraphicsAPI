@@ -112,7 +112,7 @@ struct GpuAccelerationStructure_T
 };
 #endif // GPU_RAY_TRACING_EXTENSION
 
-VkPipelineStageFlagBits gpuStageToVkStage(STAGE stage)
+VkPipelineStageFlags gpuStageToVkStage(STAGE stage)
 {
     switch (stage)
     {
@@ -121,7 +121,13 @@ VkPipelineStageFlagBits gpuStageToVkStage(STAGE stage)
     case STAGE_COMPUTE:
         return VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     case STAGE_RASTER_COLOR_OUT:
-        return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        // Color attachment output PLUS the depth fragment-test stages: producers that
+        // render offscreen (Vega's ngapi CommandModule producers) write a depth target
+        // in EARLY/LATE_FRAGMENT_TESTS, and the Painter samples that depth in the
+        // composite pass. Without the fragment-test stages a STAGE_RASTER_COLOR_OUT ->
+        // STAGE_PIXEL_SHADER barrier would not synchronize the depth writes.
+        return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     case STAGE_PIXEL_SHADER:
         return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     case STAGE_VERTEX_SHADER:
