@@ -392,6 +392,14 @@ struct VulkanInstance
         // Enable optional instance extensions only when the running system
         // exposes them (InstanceBuilder::enable_extensions hard-fails on a
         // missing extension, so filter first via SystemInfo).
+        // Track whether the running system exposes a window-system surface
+        // extension. If none is present (e.g. a headless box / a Vulkan loader
+        // built without WSI support), tell vk-bootstrap not to require windowing
+        // extensions — otherwise InstanceBuilder::build() fails with
+        // windowing_extensions_not_present even though offscreen rendering is
+        // perfectly possible. On a normal desktop a platform surface extension
+        // is present, so this leaves the windowed path unchanged.
+        bool windowingAvailable = false;
         auto systemInfoRet = vkb::SystemInfo::get_system_info();
         if (systemInfoRet.has_value())
         {
@@ -400,6 +408,10 @@ struct VulkanInstance
                 if (systemInfoRet->is_extension_available(ext))
                 {
                     requiredInstanceExtensions.push_back(ext);
+                    if (std::strstr(ext, "surface") != nullptr)
+                    {
+                        windowingAvailable = true;
+                    }
                 }
             }
         }
@@ -410,11 +422,15 @@ struct VulkanInstance
         // recording and dominates single-threaded recording time.
         const bool enableValidation = std::getenv("NGAPI_VALIDATION") != nullptr;
 
-        auto instanceRet = instanceBuilder
-                               .request_validation_layers(enableValidation)
-                               .require_api_version(VK_API_VERSION_1_4)
-                               .enable_extensions(requiredInstanceExtensions)
-                               .build();
+        instanceBuilder
+            .request_validation_layers(enableValidation)
+            .require_api_version(VK_API_VERSION_1_4)
+            .enable_extensions(requiredInstanceExtensions);
+        if (!windowingAvailable)
+        {
+            instanceBuilder.set_headless(true);
+        }
+        auto instanceRet = instanceBuilder.build();
 
         if (!instanceRet.has_value())
         {
@@ -1137,6 +1153,15 @@ void* gpuMallocHidden(VulkanDevice* vulkanDevice, size_t bytes, size_t align, ME
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
         auto alloc = vulkanDevice->createAllocation(bytes, usage, properties, align);
+        // Zero descriptor memory: on descriptor-patching devices (e.g. lavapipe)
+        // the patch pass processes every slot of the bound heap, including ones
+        // the app never wrote (UI renderers bind a heap even when they sample no
+        // textures), so uninitialized slots must read as a benign null descriptor
+        // rather than garbage that faults the patch shader.
+        if (memory == MEMORY_DESCRIPTOR && alloc.ptr)
+        {
+            memset(alloc.ptr, 0, bytes);
+        }
         return alloc.ptr;
     }
     case MEMORY_GPU: // DEVICE_LOCAL
