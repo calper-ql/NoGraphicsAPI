@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include "NoGraphicsAPI_Impl.h"
 
@@ -360,7 +361,8 @@ struct VulkanInstance
         inst->requiredDeviceExtensions = {
             VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-            VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME
+            VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME,
+            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME
         };
 
 #ifdef GPU_SURFACE_EXTENSION
@@ -446,6 +448,14 @@ struct VulkanDevice
     vkb::Device device;
     vkb::DispatchTable dispatchTable;
 
+    // Debug-label commands (VK_EXT_debug_utils). Loaded only when NGAPI_MARKERS
+    // is set and the instance extension is present; otherwise null, and the
+    // gpu*Marker entry points become no-ops.
+    PFN_vkCmdBeginDebugUtilsLabelEXT cmdBeginDebugUtilsLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT cmdEndDebugUtilsLabel = nullptr;
+    PFN_vkCmdInsertDebugUtilsLabelEXT cmdInsertDebugUtilsLabel = nullptr;
+    PFN_vkSetDebugUtilsObjectNameEXT setDebugUtilsObjectName = nullptr;
+
     // Vulkan objects
     // The device-level pool only backs the swapchains' present-transition
     // command buffers (serialized by submitMutex + per-swapchain external
@@ -482,6 +492,9 @@ struct VulkanDevice
     VkPhysicalDeviceMemoryProperties memoryProperties = {};
     VkPhysicalDeviceProperties2 physicalDeviceProperties2 = {};
     VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptorBufferProperties = {};
+    // Subgroup-size limits; cooperative-matrix pipelines pin a required,
+    // fully-populated subgroup size and must stay within [min, max].
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroupSizeControlProperties = {};
 
     // Allocation tracking
     std::vector<Allocation> allocations;
@@ -550,10 +563,21 @@ struct VulkanDevice
         descriptorBufferFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
         descriptorBufferFeatures.descriptorBuffer = VK_TRUE;
 
+        // Cooperative matrix (CoopMat in shaders) is a device feature gated by
+        // VK_KHR_cooperative_matrix; it also requires the Vulkan memory model
+        // (enabled in the Vulkan 1.2 feature block below).
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperativeMatrixFeatures = {};
+        cooperativeMatrixFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+        cooperativeMatrixFeatures.cooperativeMatrix = VK_TRUE;
+
         VkPhysicalDeviceVulkan13Features physicalDeviceVulkan13Features = {};
         physicalDeviceVulkan13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
         physicalDeviceVulkan13Features.synchronization2 = VK_TRUE;
         physicalDeviceVulkan13Features.dynamicRendering = VK_TRUE;
+        // Required to pin a fixed, fully-populated subgroup size on the
+        // cooperative-matrix (CoopMat) compute pipeline.
+        physicalDeviceVulkan13Features.subgroupSizeControl = VK_TRUE;
+        physicalDeviceVulkan13Features.computeFullSubgroups = VK_TRUE;
 
         VkPhysicalDeviceVulkan12Features physicalDeviceVulkan12Features = {};
         physicalDeviceVulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
@@ -562,6 +586,8 @@ struct VulkanDevice
         physicalDeviceVulkan12Features.runtimeDescriptorArray = VK_TRUE;
         physicalDeviceVulkan12Features.shaderInt8 = VK_TRUE;
         physicalDeviceVulkan12Features.samplerMirrorClampToEdge = VK_TRUE; // MIRROR_CLAMP address mode
+        physicalDeviceVulkan12Features.vulkanMemoryModel = VK_TRUE;        // required by VK_KHR_cooperative_matrix
+        physicalDeviceVulkan12Features.vulkanMemoryModelDeviceScope = VK_TRUE;
 #ifndef _WIN32
         physicalDeviceVulkan12Features.storagePushConstant8 = VK_TRUE;
 #endif
@@ -574,6 +600,8 @@ struct VulkanDevice
         vulkanInstance->instanceDispatchTable.getPhysicalDeviceMemoryProperties(vulkanDevice->physicalDevice, &vulkanDevice->memoryProperties);
 
         vulkanDevice->descriptorBufferProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
+        vulkanDevice->subgroupSizeControlProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+        vulkanDevice->descriptorBufferProperties.pNext = &vulkanDevice->subgroupSizeControlProperties;
         vulkanDevice->physicalDeviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
         vulkanDevice->physicalDeviceProperties2.pNext = &vulkanDevice->descriptorBufferProperties;
         vulkanInstance->instanceDispatchTable.getPhysicalDeviceProperties2(vulkanDevice->physicalDevice, &vulkanDevice->physicalDeviceProperties2);
@@ -582,7 +610,8 @@ struct VulkanDevice
         deviceBuilder
             .add_pNext(&physicalDeviceVulkan12Features)
             .add_pNext(&physicalDeviceVulkan13Features)
-            .add_pNext(&descriptorBufferFeatures);
+            .add_pNext(&descriptorBufferFeatures)
+            .add_pNext(&cooperativeMatrixFeatures);
 #ifdef GPU_RAY_TRACING_EXTENSION
         deviceBuilder
             .add_pNext(&rayQueryFeatures)
@@ -591,6 +620,20 @@ struct VulkanDevice
         auto deviceRet = deviceBuilder.build();
         vulkanDevice->device = deviceRet.value();
         vulkanDevice->dispatchTable = vulkanDevice->device.make_table();
+
+        // VK_EXT_debug_utils is an instance extension whose command-buffer label
+        // functions are device-dispatchable. Load them lazily only when the user
+        // opts in via NGAPI_MARKERS; if the extension wasn't enabled the loader
+        // returns null and every marker call short-circuits.
+        if (std::getenv("NGAPI_MARKERS") != nullptr)
+        {
+            VkDevice vkDevice = vulkanDevice->device.device;
+            PFN_vkGetDeviceProcAddr getDeviceProcAddr = vulkanDevice->device.fp_vkGetDeviceProcAddr;
+            vulkanDevice->cmdBeginDebugUtilsLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(getDeviceProcAddr(vkDevice, "vkCmdBeginDebugUtilsLabelEXT"));
+            vulkanDevice->cmdEndDebugUtilsLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(getDeviceProcAddr(vkDevice, "vkCmdEndDebugUtilsLabelEXT"));
+            vulkanDevice->cmdInsertDebugUtilsLabel = reinterpret_cast<PFN_vkCmdInsertDebugUtilsLabelEXT>(getDeviceProcAddr(vkDevice, "vkCmdInsertDebugUtilsLabelEXT"));
+            vulkanDevice->setDebugUtilsObjectName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(getDeviceProcAddr(vkDevice, "vkSetDebugUtilsObjectNameEXT"));
+        }
 
         vulkanDevice->graphicsQueueFamily = vulkanDevice->device.get_queue_index(vkb::QueueType::graphics).value();
 
@@ -1644,7 +1687,7 @@ struct StaticSamplerStage
     }
 };
 
-GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan computeIR, const char* entry)
+GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan computeIR, const char* entry, uint32_t requiredSubgroupSize)
 {
     VulkanDevice* vulkanDevice = device->vulkanDevice;
     VkShaderModuleCreateInfo shaderModuleCreateInfo = {};
@@ -1656,7 +1699,11 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan computeIR, const
     shaderModuleCreateInfo.codeSize = moduleIR.size();
     shaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(moduleIR.data());
     VkShaderModule shaderModule;
-    vulkanDevice->dispatchTable.createShaderModule(&shaderModuleCreateInfo, nullptr, &shaderModule);
+    auto createResult = vulkanDevice->dispatchTable.createShaderModule(&shaderModuleCreateInfo, nullptr, &shaderModule);
+    if (createResult != VK_SUCCESS)
+    {
+        return nullptr;
+    }
 
     VkComputePipelineCreateInfo pipelineCreateInfo = {};
     pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -1668,9 +1715,29 @@ GpuPipeline gpuCreateComputePipeline(GpuDevice device, ByteSpan computeIR, const
     pipelineCreateInfo.stage.pSpecializationInfo = samplerSpecInfo;
     pipelineCreateInfo.stage.pName = entry;
 
+    // Cooperative-matrix shaders use Subgroup memory scope and require a fixed,
+    // fully-populated subgroup size; pin it (clamped to the device's supported
+    // range) so the dispatch doesn't fault on hardware whose default subgroup
+    // size differs from what the shader was compiled for.
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo requiredSubgroupSizeInfo = {};
+    const VkPhysicalDeviceSubgroupSizeControlProperties& subgroupLimits = vulkanDevice->subgroupSizeControlProperties;
+    if (requiredSubgroupSize != 0 && (subgroupLimits.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+    {
+        uint32_t clamped = std::clamp(requiredSubgroupSize, subgroupLimits.minSubgroupSize, subgroupLimits.maxSubgroupSize);
+        requiredSubgroupSizeInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+        requiredSubgroupSizeInfo.requiredSubgroupSize = clamped;
+        pipelineCreateInfo.stage.pNext = &requiredSubgroupSizeInfo;
+        pipelineCreateInfo.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
+
     VkPipeline pipeline;
-    vulkanDevice->dispatchTable.createComputePipelines(VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline);
+    createResult = vulkanDevice->dispatchTable.createComputePipelines(VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline);
     vulkanDevice->dispatchTable.destroyShaderModule(shaderModule, nullptr);
+
+    if (createResult != VK_SUCCESS)
+    {
+        return nullptr;
+    }
 
     return new GpuPipeline_T{ pipeline, VK_PIPELINE_BIND_POINT_COMPUTE, device };
 }
@@ -2375,6 +2442,55 @@ void gpuBarrier(GpuCommandBuffer cb, STAGE before, STAGE after, HAZARD_FLAGS haz
         memoryBarrierCount, memoryBarriers,
         0, nullptr,
         0, nullptr);
+}
+
+void gpuBeginMarker(GpuCommandBuffer cb, const char* name, float3 color)
+{
+    VulkanDevice* vulkanDevice = cb->device->vulkanDevice;
+    if (vulkanDevice->cmdBeginDebugUtilsLabel == nullptr)
+    {
+        return;
+    }
+
+    VkDebugUtilsLabelEXT label = {};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0] = color.x;
+    label.color[1] = color.y;
+    label.color[2] = color.z;
+    label.color[3] = 1.f;
+
+    vulkanDevice->cmdBeginDebugUtilsLabel(cb->commandBuffer, &label);
+}
+
+void gpuEndMarker(GpuCommandBuffer cb)
+{
+    VulkanDevice* vulkanDevice = cb->device->vulkanDevice;
+    if (vulkanDevice->cmdEndDebugUtilsLabel == nullptr)
+    {
+        return;
+    }
+
+    vulkanDevice->cmdEndDebugUtilsLabel(cb->commandBuffer);
+}
+
+void gpuInsertMarker(GpuCommandBuffer cb, const char* name, float3 color)
+{
+    VulkanDevice* vulkanDevice = cb->device->vulkanDevice;
+    if (vulkanDevice->cmdInsertDebugUtilsLabel == nullptr)
+    {
+        return;
+    }
+
+    VkDebugUtilsLabelEXT label = {};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0] = color.x;
+    label.color[1] = color.y;
+    label.color[2] = color.z;
+    label.color[3] = 1.f;
+
+    vulkanDevice->cmdInsertDebugUtilsLabel(cb->commandBuffer, &label);
 }
 
 void gpuSignalAfter(GpuCommandBuffer cb, STAGE before, void* ptrGpu, uint64_t value, SIGNAL signal)

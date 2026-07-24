@@ -149,7 +149,7 @@ compile_shader(SOURCE samples/common/MsdfPixel.slang    STAGE fragment OUTPUT co
 
 set(RT_SHADER_DEPS ${COMMON_SHADER_DEPS}
     "${CMAKE_CURRENT_SOURCE_DIR}/samples/raytracing/Raytracing.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/samples/raytracing/Random.h")
+    "${CMAKE_CURRENT_SOURCE_DIR}/samples/common/Random.h")
 compile_shader(SOURCE samples/raytracing/Raytracing.slang STAGE compute OUTPUT raytracing/Raytracing.spv
     EXTRA_DEPENDS ${RT_SHADER_DEPS})
 compile_shader(SOURCE samples/raytracing/ReSTIR.slang   STAGE compute  OUTPUT raytracing/RIS.spv   ENTRY RIS
@@ -168,12 +168,12 @@ compile_shader(SOURCE samples/samplerbench/SamplerBench.slang STAGE compute OUTP
 compile_shader(SOURCE samples/multithreading/Multithreading.slang STAGE compute OUTPUT multithreading/Multithreading.spv
     EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/multithreading/Multithreading.h")
 
-# The learning sample's tensor ops are nine compute entry points in one .slang;
-# compile them all into a single Tensor.spv (Device_impl builds a pipeline per
-# entry point from that one module).
+# The learning sample's tensor ops are dozens of compute entry points
 compile_shader(SOURCE samples/learning/Tensor.slang STAGE compute OUTPUT learning/Tensor.spv
-    ENTRY _add _sub _mul _div _dot _mT _matmul _pow _log _cosh _tanh _relu _relu_backward _adam
-    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h")
+    ALL_ENTRIES
+    EXTRA_DEPENDS ${COMMON_SHADER_DEPS} 
+    "${CMAKE_CURRENT_SOURCE_DIR}/samples/learning/Common.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/samples/common/Random.h")
 
 add_custom_target(shaders ALL DEPENDS ${NGAPI_SHADER_OUTPUTS})
 
