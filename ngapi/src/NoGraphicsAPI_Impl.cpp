@@ -2354,105 +2354,118 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
 void gpuBarrier(GpuCommandBuffer cb, STAGE before, STAGE after, HAZARD_FLAGS hazards)
 {
     VulkanDevice* vulkanDevice = cb->device->vulkanDevice;
-    // At most one barrier per hazard flag plus the base barrier; a fixed
-    // array keeps this hot, per-thread recording path free of heap traffic
-    // (a per-call std::vector here was a malloc-lock convoy under parallel
-    // recording).
-    VkMemoryBarrier memoryBarriers[5];
+    // One VkMemoryBarrier2 for the stage-to-stage dependency plus one per
+    // hazard flag. Each carries its own stage masks, so every access type is
+    // paired with a stage that performs it: a hazard's consumer is often not
+    // `after` itself (indirect arguments are read in DRAW_INDIRECT, depth in
+    // the fragment-test stages), and pairing its access with `after`'s stages
+    // produces an invalid barrier (VUID-*-dstAccessMask-*) that orders nothing.
+    // A fixed array keeps this hot, per-thread recording path free of heap
+    // traffic (a per-call std::vector here was a malloc-lock convoy under
+    // parallel recording).
+    VkMemoryBarrier2 memoryBarriers[5];
     uint32_t memoryBarrierCount = 0;
 
-    auto stageWriteAccess = [](STAGE stage) -> VkAccessFlags
+    auto stageWriteAccess = [](STAGE stage) -> VkAccessFlags2
     {
         switch (stage)
         {
         case STAGE_TRANSFER:
-            return VK_ACCESS_TRANSFER_WRITE_BIT;
+            return VK_ACCESS_2_TRANSFER_WRITE_BIT;
         case STAGE_COMPUTE:
         case STAGE_PIXEL_SHADER:
         case STAGE_VERTEX_SHADER:
-            return VK_ACCESS_SHADER_WRITE_BIT;
+            return VK_ACCESS_2_SHADER_WRITE_BIT;
         case STAGE_RASTER_COLOR_OUT:
-            return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            // Includes the fragment-test stages (see gpuStageToVkStage), so
+            // depth writes are flushed along with color.
+            return VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         case STAGE_ACCELERATION_STRUCTURE_BUILD:
-            return VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+            return VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
         default:
-            return VK_ACCESS_MEMORY_WRITE_BIT;
+            return VK_ACCESS_2_MEMORY_WRITE_BIT;
         }
     };
 
-    auto stageReadWriteAccess = [](STAGE stage) -> VkAccessFlags
+    auto stageReadWriteAccess = [](STAGE stage) -> VkAccessFlags2
     {
         switch (stage)
         {
         case STAGE_TRANSFER:
-            return VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            return VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
         case STAGE_COMPUTE:
         case STAGE_PIXEL_SHADER:
         case STAGE_VERTEX_SHADER:
-            return VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                   VK_ACCESS_UNIFORM_READ_BIT;
+            return VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                   VK_ACCESS_2_UNIFORM_READ_BIT;
         case STAGE_RASTER_COLOR_OUT:
-            return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            return VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         case STAGE_ACCELERATION_STRUCTURE_BUILD:
-            return VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                   VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+            // SHADER_READ: the build's geometry/instance inputs.
+            return VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                   VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR |
+                   VK_ACCESS_2_SHADER_READ_BIT;
         default:
-            return VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            return VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
         }
     };
 
+    // Every stage that can read descriptors or acceleration structures. (No
+    // task/mesh bits: those are only valid once the mesh shader features are
+    // enabled, which the device does not do.)
+    constexpr VkPipelineStageFlags2 allShaderStages =
+        VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+
+    const VkPipelineStageFlags2 srcStage = gpuStageToVkStage(before);
+    const VkAccessFlags2 srcAccess = stageWriteAccess(before);
+
+    auto addBarrier = [&](VkPipelineStageFlags2 srcStageMask, VkAccessFlags2 srcAccessMask,
+                          VkPipelineStageFlags2 dstStageMask, VkAccessFlags2 dstAccessMask)
     {
-        VkMemoryBarrier memoryBarrier = {};
-        memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        memoryBarrier.srcAccessMask = stageWriteAccess(before);
-        memoryBarrier.dstAccessMask = stageReadWriteAccess(after);
+        VkMemoryBarrier2 memoryBarrier = {};
+        memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        memoryBarrier.srcStageMask = srcStageMask;
+        memoryBarrier.srcAccessMask = srcAccessMask;
+        memoryBarrier.dstStageMask = dstStageMask;
+        memoryBarrier.dstAccessMask = dstAccessMask;
         memoryBarriers[memoryBarrierCount++] = memoryBarrier;
-    }
+    };
+
+    addBarrier(srcStage, srcAccess, gpuStageToVkStage(after), stageReadWriteAccess(after));
 
     if (hazards & HAZARD_DRAW_ARGUMENTS)
     {
-        VkMemoryBarrier memoryBarrier = {};
-        memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        memoryBarrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-        memoryBarriers[memoryBarrierCount++] = memoryBarrier;
+        addBarrier(srcStage, srcAccess, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     }
 
     if (hazards & HAZARD_DESCRIPTORS)
     {
-        VkMemoryBarrier memoryBarrier = {};
-        memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        memoryBarrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        memoryBarriers[memoryBarrierCount++] = memoryBarrier;
+        addBarrier(srcStage, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                   allShaderStages, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_DESCRIPTOR_BUFFER_READ_BIT_EXT);
     }
 
     if (hazards & HAZARD_DEPTH_STENCIL)
     {
-        VkMemoryBarrier memoryBarrier = {};
-        memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        memoryBarrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        memoryBarrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        memoryBarriers[memoryBarrierCount++] = memoryBarrier;
+        addBarrier(srcStage, srcAccess,
+                   VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
     }
 
     if (hazards & HAZARD_ACCELERATION_STRUCTURE)
     {
-        VkMemoryBarrier memoryBarrier = {};
-        memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        memoryBarrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        memoryBarrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-        memoryBarriers[memoryBarrierCount++] = memoryBarrier;
+        addBarrier(srcStage, srcAccess,
+                   VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | allShaderStages,
+                   VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
     }
 
-    vulkanDevice->dispatchTable.cmdPipelineBarrier(
-        cb->commandBuffer,
-        gpuStageToVkStage(before),
-        gpuStageToVkStage(after),
-        0,
-        memoryBarrierCount, memoryBarriers,
-        0, nullptr,
-        0, nullptr);
+    VkDependencyInfo dependencyInfo = {};
+    dependencyInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependencyInfo.memoryBarrierCount = memoryBarrierCount;
+    dependencyInfo.pMemoryBarriers = memoryBarriers;
+    vulkanDevice->dispatchTable.cmdPipelineBarrier2(cb->commandBuffer, &dependencyInfo);
 }
 
 void gpuBeginMarker(GpuCommandBuffer cb, const char* name, float3 color)
