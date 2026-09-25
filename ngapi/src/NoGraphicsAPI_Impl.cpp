@@ -1808,15 +1808,22 @@ VkPipeline gpuCreateGraphicsPipelineInternal(VulkanDevice* vulkanDevice, ByteSpa
     vertexShaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     vertexShaderModuleCreateInfo.codeSize = vertexModuleIR.size();
     vertexShaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(vertexModuleIR.data());
-    VkShaderModule vertexShaderModule;
-    vulkanDevice->dispatchTable.createShaderModule(&vertexShaderModuleCreateInfo, nullptr, &vertexShaderModule);
+    VkShaderModule vertexShaderModule = VK_NULL_HANDLE;
+    if (vulkanDevice->dispatchTable.createShaderModule(&vertexShaderModuleCreateInfo, nullptr, &vertexShaderModule) != VK_SUCCESS)
+    {
+        return VK_NULL_HANDLE;
+    }
 
     VkShaderModuleCreateInfo pixelShaderModuleCreateInfo = {};
     pixelShaderModuleCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     pixelShaderModuleCreateInfo.codeSize = pixelModuleIR.size();
     pixelShaderModuleCreateInfo.pCode = reinterpret_cast<const uint32_t*>(pixelModuleIR.data());
-    VkShaderModule pixelShaderModule;
-    vulkanDevice->dispatchTable.createShaderModule(&pixelShaderModuleCreateInfo, nullptr, &pixelShaderModule);
+    VkShaderModule pixelShaderModule = VK_NULL_HANDLE;
+    if (vulkanDevice->dispatchTable.createShaderModule(&pixelShaderModuleCreateInfo, nullptr, &pixelShaderModule) != VK_SUCCESS)
+    {
+        vulkanDevice->dispatchTable.destroyShaderModule(vertexShaderModule, nullptr);
+        return VK_NULL_HANDLE;
+    }
 
     VkPipelineShaderStageCreateInfo shaderStages[2] = {};
     shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -1911,7 +1918,9 @@ VkPipeline gpuCreateGraphicsPipelineInternal(VulkanDevice* vulkanDevice, ByteSpa
     VkPipelineRasterizationStateCreateInfo rasterizationState = {};
     rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizationState.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterizationState.cullMode = desc.cull != CULL_NONE ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    rasterizationState.cullMode = desc.cull == CULL_NONE  ? VK_CULL_MODE_NONE
+                                  : desc.cull == CULL_ALL ? VK_CULL_MODE_FRONT_AND_BACK
+                                                          : VK_CULL_MODE_BACK_BIT;
     rasterizationState.frontFace = desc.cull == CULL_CW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizationState.lineWidth = 1.0f;
     rasterizationState.depthClampEnable = VK_FALSE;
@@ -1964,18 +1973,22 @@ VkPipeline gpuCreateGraphicsPipelineInternal(VulkanDevice* vulkanDevice, ByteSpa
     pipelineCreateInfo.pDynamicState = &dynamicState;
     pipelineCreateInfo.stageCount = 2;
 
-    VkPipeline pipeline;
-    vulkanDevice->dispatchTable.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult result = vulkanDevice->dispatchTable.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline);
     vulkanDevice->dispatchTable.destroyShaderModule(vertexShaderModule, nullptr);
     vulkanDevice->dispatchTable.destroyShaderModule(pixelShaderModule, nullptr);
 
-    return pipeline;
+    return result == VK_SUCCESS ? pipeline : VK_NULL_HANDLE;
 }
 
 GpuPipeline gpuCreateGraphicsPipeline(GpuDevice device, ByteSpan vertexIR, ByteSpan pixelIR, GpuRasterDesc desc)
 {
     VulkanDevice* vulkanDevice = device->vulkanDevice;
     VkPipeline pipeline = gpuCreateGraphicsPipelineInternal(vulkanDevice, vertexIR, ByteSpan{}, pixelIR, desc);
+    if (pipeline == VK_NULL_HANDLE)
+    {
+        return nullptr;
+    }
     return new GpuPipeline_T{ pipeline, VK_PIPELINE_BIND_POINT_GRAPHICS, device };
 }
 
@@ -1983,11 +1996,20 @@ GpuPipeline gpuCreateGraphicsMeshletPipeline(GpuDevice device, ByteSpan meshletI
 {
     VulkanDevice* vulkanDevice = device->vulkanDevice;
     VkPipeline pipeline = gpuCreateGraphicsPipelineInternal(vulkanDevice, ByteSpan{}, meshletIR, pixelIR, desc);
+    if (pipeline == VK_NULL_HANDLE)
+    {
+        return nullptr;
+    }
     return new GpuPipeline_T{ pipeline, VK_PIPELINE_BIND_POINT_GRAPHICS, device };
 }
 
 void gpuFreePipeline(GpuPipeline pipeline)
 {
+    if (pipeline == nullptr)
+    {
+        return;
+    }
+
     VulkanDevice* vulkanDevice = pipeline->device->vulkanDevice;
     vulkanDevice->dispatchTable.destroyPipeline(pipeline->pipeline, nullptr);
     delete pipeline;
@@ -2530,14 +2552,23 @@ void gpuInsertMarker(GpuCommandBuffer cb, const char* name, float3 color)
     vulkanDevice->cmdInsertDebugUtilsLabel(cb->commandBuffer, &label);
 }
 
+// Declared but not implemented yet. Failing loudly beats a silent no-op: code
+// that relies on these for synchronization or blending would otherwise run
+// and race or render wrong with no indication why.
+[[noreturn]] static void gpuNotImplemented(const char* function)
+{
+    fprintf(stderr, "NoGraphicsAPI: %s is not implemented yet\n", function);
+    abort();
+}
+
 void gpuSignalAfter(GpuCommandBuffer cb, STAGE before, void* ptrGpu, uint64_t value, SIGNAL signal)
 {
-    // TODO: implement
+    gpuNotImplemented("gpuSignalAfter");
 }
 
 void gpuWaitBefore(GpuCommandBuffer cb, STAGE after, void* ptrGpu, uint64_t value, OP op, HAZARD_FLAGS hazards, uint64_t mask)
 {
-    // TODO: implement
+    gpuNotImplemented("gpuWaitBefore");
 }
 
 void gpuSetPipeline(GpuCommandBuffer cb, GpuPipeline pipeline)
@@ -2598,7 +2629,8 @@ void gpuSetDepthStencilState(GpuCommandBuffer cb, GpuDepthStencilState state)
 
 void gpuSetBlendState(GpuCommandBuffer cb, GpuBlendState state)
 {
-    // TODO: implement
+    // Blending is currently baked into the pipeline (GpuRasterDesc::blendState).
+    gpuNotImplemented("gpuSetBlendState");
 }
 
 void gpuDispatch(GpuCommandBuffer cb, void* dataGpu, uint3 gridDimensions)
