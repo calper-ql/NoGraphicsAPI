@@ -1240,6 +1240,13 @@ void* gpuMalloc(GpuDevice device, size_t bytes, size_t align, MEMORY memory)
 
 void gpuFree(GpuDevice device, void* ptr)
 {
+    // GPU-only allocations have ptr == nullptr, so without this a null free
+    // would match (and free) the first MEMORY_GPU allocation below.
+    if (ptr == nullptr)
+    {
+        return;
+    }
+
     VulkanDevice* vulkanDevice = device->vulkanDevice;
     Allocation match = {};
     {
@@ -2130,7 +2137,7 @@ GpuSemaphore gpuCreateSemaphore(GpuDevice device, uint64_t initValue)
     return new GpuSemaphore_T{ semaphore, device };
 }
 
-void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
+RESULT gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
 {
     VulkanDevice* vulkanDevice = sema->device->vulkanDevice;
     VkSemaphoreWaitInfo waitInfo = {};
@@ -2139,7 +2146,12 @@ void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
     waitInfo.pSemaphores = &sema->semaphore;
     waitInfo.pValues = &value;
 
-    vulkanDevice->dispatchTable.waitSemaphores(&waitInfo, timeout);
+    if (vulkanDevice->dispatchTable.waitSemaphores(&waitInfo, timeout) != VK_SUCCESS)
+    {
+        // VK_TIMEOUT (or device loss): submissions up to `value` may still be
+        // executing, so their command pools must not be reset and recycled.
+        return RESULT_FAILURE;
+    }
 
     // Retire the command pools for this semaphore value and any earlier ones.
     // Collected under the submit lock, reset outside it, then recycled: the
@@ -2168,6 +2180,7 @@ void gpuWaitSemaphore(GpuSemaphore sema, uint64_t value, uint64_t timeout)
         std::lock_guard lock(vulkanDevice->poolFreeListMutex);
         vulkanDevice->commandPoolFreeList.insert(vulkanDevice->commandPoolFreeList.end(), retired.begin(), retired.end());
     }
+    return RESULT_SUCCESS;
 }
 
 void gpuDestroySemaphore(GpuSemaphore sema)
