@@ -2433,14 +2433,19 @@ void gpuSetActiveTextureHeapPtr(GpuCommandBuffer cb, void* ptrGpu)
     uint32_t indices[3] = { 0, 1, 2 }; // read, read/write, sampler
     VkDeviceSize offsets[3] = { 0, 0, 0 };
 
-    vulkanDevice->dispatchTable.cmdSetDescriptorBufferOffsetsEXT(
-        cb->commandBuffer,
-        cb->currentPipeline->bindPoint,
-        vulkanDevice->layout[cb->currentPipeline->bindPoint],
-        0,
-        3,
-        indices,
-        offsets);
+    // Both bind points, so the heap stays bound across graphics and compute
+    // work and does not depend on (or need) a pipeline being bound first.
+    for (VkPipelineBindPoint bindPoint : { VK_PIPELINE_BIND_POINT_GRAPHICS, VK_PIPELINE_BIND_POINT_COMPUTE })
+    {
+        vulkanDevice->dispatchTable.cmdSetDescriptorBufferOffsetsEXT(
+            cb->commandBuffer,
+            bindPoint,
+            vulkanDevice->layout[bindPoint],
+            0,
+            3,
+            indices,
+            offsets);
+    }
 }
 
 void gpuBarrier(GpuCommandBuffer cb, STAGE before, STAGE after, HAZARD_FLAGS hazards)
