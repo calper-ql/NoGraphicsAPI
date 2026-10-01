@@ -2938,6 +2938,12 @@ static void buildSwapchainResources(GpuSwapchain swapchain)
     vkb::SwapchainBuilder builder{ vulkanDevice->device, swapchain->surface };
     builder.add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
         .set_old_swapchain(swapchain->swapchain);
+    // A UNORM swapchain: the app renders display-ready (sRGB-encoded) values and blits them in.
+    // vk-bootstrap's default prefers *_SRGB, where the blit encodes them a second time and every
+    // dark colour comes out lifted (a #0c box showed as #3d on a real GPU; Xvfb only offers UNORM,
+    // so the two looked different).
+    builder.set_desired_format({ VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
+        .add_fallback_format({ VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR });
     // When the surface dictates its own size (e.g. X11) vk-bootstrap uses
     // currentExtent and ignores this; when it does not (e.g. Wayland reports
     // currentExtent = 0xFFFFFFFF) vk-bootstrap would otherwise fall back to its
